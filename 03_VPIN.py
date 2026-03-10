@@ -220,7 +220,7 @@ def run_preprocessing(base_dir: str, year_folders: list | None, output_dir: str)
 
     반환: 1m_bars 폴더 경로 (실패 시 빈 문자열)
     """
-    bars_dir = os.path.join(output_dir, "1m_bars")
+    bars_dir = os.path.join(output_dir, "vpin", "1m_bars")
     os.makedirs(bars_dir, exist_ok=True)
 
     parquet_files = get_parquet_files(base_dir, year_folders)
@@ -495,11 +495,9 @@ def run_vpin_calculation(
 
     반환: vpin_results 폴더 경로 (실패 시 빈 문자열)
     """
-    results_dir    = os.path.join(output_dir, "vpin_results")
-    sym_input_dir  = os.path.join(output_dir, "intermediate",
-                                  f"session_{run_id}", "sym_input")
-    sym_result_dir = os.path.join(output_dir, "intermediate",
-                                  f"session_{run_id}", "sym_result")
+    results_dir    = os.path.join(output_dir, "vpin", "results")
+    sym_input_dir  = os.path.join(output_dir, "vpin", "sessions", run_id, "sym_input")
+    sym_result_dir = os.path.join(output_dir, "vpin", "sessions", run_id, "sym_result")
 
     for d in [results_dir, sym_input_dir, sym_result_dir]:
         os.makedirs(d, exist_ok=True)

@@ -41,7 +41,7 @@ SAS 날짜(1960-01-01 기준 경과 일수)·시간(자정 이후 경과 초)을
    - 그리드 탐색: PIN은 3^5=243개, APIN은 3^10=59,049개 후보 → NLL 최소 초기값 선택
    - L-BFGS-B 정밀 최적화
 5. **병렬화**: `multiprocessing.Pool` + `init_worker`(grid·calendar 워커당 1회 직렬화) + `imap_unordered`
-6. **체크포인트**: `intermediate/session_<RUN_ID>/[pin|apin]_checkpoint_NNNN.parquet`에 N종목마다 저장
+6. **체크포인트**: `pin/checkpoints/<RUN_ID>/pin_checkpoint_NNNN.parquet` (APIN은 `apin/checkpoints/`)에 N종목마다 저장
 
 ### VPIN 파이프라인 (03_VPIN.py)
 
@@ -51,7 +51,7 @@ SAS 날짜(1960-01-01 기준 경과 일수)·시간(자정 이후 경과 초)을
 - BVC: `ProbBuy = CDF_t(ΔP/σ; df=0.25)` (Student-t 분포)
 - 버킷 크기 `V = ADV(해당 연도) / BUCKETS_PER_DAY` — 연도별 동적 산출
 - `VPIN = Σ|V_buy - V_sell| / (ROLLING_WINDOW × V)`, 롤링 50버킷
-- 결과를 종목별로 `output/vpin_results/sym_{symbol}.parquet`에 직접 저장 (RAM 누적 없음)
+- 결과를 종목별로 `vpin/results/sym_{symbol}.parquet`에 직접 저장 (RAM 누적 없음)
 - 체크포인트: `vpin_results/` 폴더 내 파일 존재 여부로 완료 판단
 
 ## 주요 파일
@@ -98,24 +98,33 @@ BUCKETS_PER_DAY       = 50     # V = ADV / 이 값
 2. 스크립트 재실행
 3. 완료 후 `RESUME_RUN_ID = None`으로 복원
 
-세션 폴더(`intermediate/session_<RUN_ID>/`)가 RUN_ID별로 격리되므로 인풋이 달라진 새 실행과 섞이지 않는다.
+세션 폴더(`pin/checkpoints/<RUN_ID>/`, `apin/checkpoints/<RUN_ID>/`, `vpin/sessions/<RUN_ID>/`)가 모델별·RUN_ID별로 격리되므로 인풋이 달라진 새 실행과 섞이지 않는다.
 
 ## 출력 파일
 
 ```
 output_data/
-├── all_daily_bs.parquet                          # 일별 B/S 집계 (PIN/APIN Step1 결과)
-├── pin_daily_rolling_{year}_{RUN_ID}.parquet     # 최종 PIN 결과
-├── pin_daily_rolling_{year}_{RUN_ID}_SAMPLE.csv
-├── apin_daily_rolling_{year}_{RUN_ID}.parquet    # 최종 APIN 결과
-├── apin_daily_rolling_{year}_{RUN_ID}_SAMPLE.csv
-├── 1m_bars/
-│   └── 1m_bars_KOR_{year}.parquet               # VPIN Step1: 연도별 1분봉
-├── vpin_results/
-│   └── sym_{symbol}.parquet                     # VPIN 결과 (종목별 파일)
-└── intermediate/session_{RUN_ID}/
-    ├── [pin|apin]_checkpoint_0000.parquet
-    └── [pin|apin]_checkpoint_0001.parquet ...
+├── all_daily_bs.parquet                                    # 일별 B/S 집계 (PIN/APIN Step1 결과)
+├── pin/
+│   ├── pin_rolling_{year}_{RUN_ID}.parquet                # 최종 PIN 결과
+│   ├── pin_rolling_{year}_{RUN_ID}_sample.csv
+│   └── checkpoints/{RUN_ID}/
+│       ├── pin_checkpoint_0000.parquet
+│       └── pin_checkpoint_0001.parquet ...
+├── apin/
+│   ├── apin_rolling_{year}_{RUN_ID}.parquet               # 최종 APIN 결과
+│   ├── apin_rolling_{year}_{RUN_ID}_sample.csv
+│   └── checkpoints/{RUN_ID}/
+│       ├── apin_checkpoint_0000.parquet
+│       └── apin_checkpoint_0001.parquet ...
+└── vpin/
+    ├── 1m_bars/
+    │   └── 1m_bars_KOR_{year}.parquet                     # VPIN Step1: 연도별 1분봉
+    ├── results/
+    │   └── sym_{symbol}.parquet                           # VPIN 최종 결과 (종목별 파일)
+    └── sessions/{RUN_ID}/
+        ├── sym_input/sym_{symbol}.parquet                 # 종목별 입력 (임시)
+        └── sym_result/sym_{symbol}.parquet                # 계산 완료 대기 (임시)
 ```
 
 최종 결과 스키마:

@@ -814,10 +814,9 @@ def run_pin_calculation(daily_bs_path: str, output_dir: str,
     Returns:
       Schema: Symbol, Date, B, S, a, d, u, eb, es, PIN
     """
-    # 세션 전용 폴더: RUN_ID별로 격리
-    intermediate_dir = os.path.join(output_dir, "intermediate")
-    session_dir      = os.path.join(intermediate_dir, f"pin_session_session_{run_id}")
-    os.makedirs(output_dir, exist_ok=True)
+    # Session folder: isolated per model type and RUN_ID
+    session_dir = os.path.join(output_dir, "pin", "checkpoints", run_id)
+    os.makedirs(os.path.join(output_dir, "pin"), exist_ok=True)
     os.makedirs(session_dir, exist_ok=True)
 
     print(f"\n{'='*65}")
@@ -1017,20 +1016,21 @@ if __name__ == "__main__":
 
     # 결과 저장 및 요약 출력
     if not result.is_empty():
-        # 최종 파일명에 RUN_ID(시작 타임스탬프)를 사용
-        # → 체크포인트 세션 폴더명(session_<RUN_ID>)과 1:1 대응
         year_tag        = "_".join(str(y) for y in year_filter) if year_filter else "ALL"
-        output_filename = f"pin_daily_rolling_{year_tag}_{run_id}"
+        output_filename = f"pin_rolling_{year_tag}_{run_id}"
 
-        # 전체 결과: parquet (ZSTD 압축)
-        parquet_path = os.path.join(OUTPUT_DIR, f"{output_filename}.parquet")
+        pin_dir = os.path.join(OUTPUT_DIR, "pin")
+        os.makedirs(pin_dir, exist_ok=True)
+
+        # Full results as parquet (ZSTD compressed)
+        parquet_path = os.path.join(pin_dir, f"{output_filename}.parquet")
         result.write_parquet(parquet_path, compression="zstd")
-        print(f"\n[저장 완료] {parquet_path}")
+        print(f"\n[Saved] {parquet_path}")
 
-        # 확인용 샘플: 상위 1000행 CSV
-        csv_path = os.path.join(OUTPUT_DIR, f"{output_filename}_SAMPLE.csv")
+        # Sample: top 1000 rows as CSV
+        csv_path = os.path.join(pin_dir, f"{output_filename}_sample.csv")
         result.head(1000).write_csv(csv_path)
-        print(f"[샘플 저장] {csv_path}")
+        print(f"[Sample] {csv_path}")
 
         print("\n[미리보기]")
         print(result.head(20))

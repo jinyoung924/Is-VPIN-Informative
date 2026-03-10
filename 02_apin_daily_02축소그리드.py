@@ -793,9 +793,9 @@ def run_apin_calculation(daily_bs_path: str, output_dir: str,
       - init_worker에 calendar만 전달 (grid 불필요)
       - 고정 그리드 + Top-K + 웜 스타트는 process_single_symbol 내부에서 처리
     """
-    intermediate_dir = os.path.join(output_dir, "intermediate")
-    session_dir      = os.path.join(intermediate_dir, f"apin_session_{run_id}")
-    os.makedirs(output_dir, exist_ok=True)
+    # Session folder: isolated per model type and RUN_ID
+    session_dir = os.path.join(output_dir, "apin", "checkpoints", run_id)
+    os.makedirs(os.path.join(output_dir, "apin"), exist_ok=True)
     os.makedirs(session_dir, exist_ok=True)
 
     print(f"\n{'='*65}")
@@ -955,15 +955,20 @@ if __name__ == "__main__":
 
     if not result.is_empty():
         year_tag        = "_".join(str(y) for y in year_filter) if year_filter else "ALL"
-        output_filename = f"apin_daily_rolling_{year_tag}_{run_id}"
+        output_filename = f"apin_rolling_{year_tag}_{run_id}"
 
-        parquet_path = os.path.join(OUTPUT_DIR, f"{output_filename}.parquet")
+        apin_dir = os.path.join(OUTPUT_DIR, "apin")
+        os.makedirs(apin_dir, exist_ok=True)
+
+        # Full results as parquet (ZSTD compressed)
+        parquet_path = os.path.join(apin_dir, f"{output_filename}.parquet")
         result.write_parquet(parquet_path, compression="zstd")
-        print(f"\n[저장 완료] {parquet_path}")
+        print(f"\n[Saved] {parquet_path}")
 
-        csv_path = os.path.join(OUTPUT_DIR, f"{output_filename}_SAMPLE.csv")
+        # Sample: top 1000 rows as CSV
+        csv_path = os.path.join(apin_dir, f"{output_filename}_sample.csv")
         result.head(1000).write_csv(csv_path)
-        print(f"[샘플 저장] {csv_path}")
+        print(f"[Sample] {csv_path}")
 
         print("\n[미리보기]")
         print(result.head(20))

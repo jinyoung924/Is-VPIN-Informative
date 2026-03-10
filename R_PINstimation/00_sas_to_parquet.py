@@ -42,11 +42,15 @@ SAS7BDAT → Parquet 배치 변환 스크립트
   2017-01-18 | 09:21:45.197972089 | "258540" | 14450.0 | 1.0    | -1
 
 [파일 구조]
-  입력: E:\\vpin_project_sas7bdat\\KOR_{year}\\*.sas7bdat
-          DATA_FOLDER에서 파싱한 시작연도~종료연도의 KOR_{year} 폴더를 순회
-  출력: E:\\vpin_project_parquet\\{DATA_FOLDER}\\*.parquet
-          모든 변환 파일을 DATA_FOLDER 이름의 단일 폴더에 집약
-          (하위 파이프라인 01_preprocess.py 들이 이 폴더를 직접 읽음)
+  입력: {BASE_INPUT_DIR}/{COUNTRY}_{year}/*.sas7bdat
+          BASE_INPUT_DIR 아래의 모든 {COUNTRY}_{year} 폴더를 자동 탐색
+          예) KOR_2019/, KOR_2020/, US_2019/ ...
+
+  출력: {BASE_OUTPUT_DIR}/{COUNTRY}_{min_YYYYMM}_{max_YYYYMM}/*.parquet
+          국가별로 파일명에서 YYYYMM을 파싱하여 범위를 자동 산출
+          예) KOR_201901_202107/KOR_201901.parquet
+              US_201901_202012/US_201901.parquet
+          (하위 파이프라인 01_preprocess.py 들이 이 폴더를 DATA_FOLDER로 지정하여 읽음)
 """
 
 import re
@@ -67,11 +71,10 @@ BASE_INPUT_DIR  = Path(r"E:\vpin_project_sas7bdat")
 # Parquet 출력 루트 폴더 (하위 파이프라인의 BASE_DIR과 동일)
 BASE_OUTPUT_DIR = Path(r"E:\vpin_project_parquet")
 
-# 변환할 데이터 범위
-# 형식: {나라코드}_{시작YYYYMM}_{종료YYYYMM}
-# 입력 SAS 폴더: BASE_INPUT_DIR / KOR_{year} (시작연도 ~ 종료연도 순회)
-# 출력 Parquet 폴더: BASE_OUTPUT_DIR / DATA_FOLDER (단일 폴더에 집약)
-DATA_FOLDER = "KOR_201910_202107"
+# 처리할 국가 코드 목록
+# None → BASE_INPUT_DIR 아래의 모든 국가 자동 처리
+# 일부만 처리: ["KOR", "US"]
+TARGET_COUNTRIES = None
 
 CHUNK_SIZE = 5_000_000  # 500만 행 단위
 
@@ -79,20 +82,59 @@ CHUNK_SIZE = 5_000_000  # 500만 행 단위
 # (이하 수정 불필요)
 # ==========================================
 
-_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{4})\d{2}_(\d{4})\d{2}$")
+VALID_COUNTRIES = {"KOR", "US", "JP", "CA", "FR", "GR", "HK", "IT", "UK"}
 
-def _parse_folder(folder: str):
-    m = _FOLDER_RE.match(folder)
-    if not m:
-        raise ValueError(
-            f"DATA_FOLDER 형식 오류: '{folder}'\n"
-            f"  올바른 형식: {{나라코드}}_{{YYYYMM}}_{{YYYYMM}}\n"
-            f"  예) KOR_201910_202107"
-        )
-    return m.group(1), int(m.group(2)), int(m.group(3))  # country, start_year, end_year
+# BASE_INPUT_DIR 하위 폴더명 패턴: {COUNTRY}_{year}  예) KOR_2019
+_INPUT_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{4})$")
 
-COUNTRY, START_YEAR, END_YEAR = _parse_folder(DATA_FOLDER)
-OUTPUT_DIR = BASE_OUTPUT_DIR / DATA_FOLDER
+# SAS 파일명에서 YYYYMM 추출 패턴: KOR_201901.sas7bdat → 201901
+_FILE_YYYYMM_RE  = re.compile(r"_(\d{6})$")
+
+
+def discover_country_groups(base_input_dir: Path, target_countries) -> dict:
+    """
+    BASE_INPUT_DIR 아래의 {COUNTRY}_{year} 폴더를 스캔하여
+    국가별로 SAS 파일 목록을 그룹화한다.
+
+    Returns
+    -------
+    dict: {country: [Path, ...]}  파일은 이름 순 정렬
+    """
+    groups = {}
+    for item in sorted(base_input_dir.iterdir()):
+        if not item.is_dir():
+            continue
+        m = _INPUT_FOLDER_RE.match(item.name)
+        if not m:
+            continue
+        country = m.group(1)
+        if country not in VALID_COUNTRIES:
+            continue
+        if target_countries and country not in target_countries:
+            continue
+        sas_files = sorted(item.glob("*.sas7bdat"))
+        if sas_files:
+            groups.setdefault(country, []).extend(sas_files)
+    return groups
+
+
+def get_yyyymm_range(sas_files: list):
+    """
+    파일명 stem에서 YYYYMM을 파싱하여 최솟값·최댓값을 반환한다.
+    파싱 불가 파일은 무시한다.
+
+    Returns
+    -------
+    (min_yyyymm, max_yyyymm) 또는 파싱 실패 시 (None, None)
+    """
+    yyyymm_list = []
+    for f in sas_files:
+        m = _FILE_YYYYMM_RE.search(f.stem)
+        if m:
+            yyyymm_list.append(m.group(1))
+    if not yyyymm_list:
+        return None, None
+    return min(yyyymm_list), max(yyyymm_list)
 
 
 def process_chunk_for_polars(df: pd.DataFrame) -> pd.DataFrame:
@@ -263,61 +305,72 @@ def convert_single_file(input_sas_file: Path, output_parquet_file: Path) -> None
 
 def run_batch_conversion() -> None:
     """
-    DATA_FOLDER에서 파싱한 연도 범위의 모든 SAS 파일을 배치 변환합니다.
+    BASE_INPUT_DIR 아래의 모든 {COUNTRY}_{year} 폴더를 자동 탐색하여
+    국가별로 SAS 파일을 Parquet으로 배치 변환합니다.
 
-    디렉토리 구조:
-      {BASE_INPUT_DIR}/{COUNTRY}_{year}/*.sas7bdat  →  {BASE_OUTPUT_DIR}/{DATA_FOLDER}/*.parquet
+    출력 폴더는 파일명에서 파싱한 YYYYMM 범위로 자동 결정됩니다.
+      예) KOR_2019/, KOR_2020/, KOR_2021/ 의 파일들
+          → BASE_OUTPUT_DIR/KOR_201901_202107/ 에 집약
 
-    - 출력은 DATA_FOLDER 이름의 단일 폴더에 모든 파일을 집약합니다.
     - 이미 변환된 파일(.parquet 존재)은 건너뜁니다 (중단 후 재실행 안전).
-    - 원본 연도 폴더가 없으면 경고 후 다음 연도로 넘어갑니다.
+    - YYYYMM을 파일명에서 파싱할 수 없는 경우 해당 국가는 건너뜁니다.
     """
     total_start_time = time.time()
     total_files_processed = 0
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"\n{'='*60}")
+    print(f"[SAS → Parquet 전체 변환]")
+    print(f"  입력 루트: {BASE_INPUT_DIR}")
+    print(f"  출력 루트: {BASE_OUTPUT_DIR}")
+    print(f"  대상 국가: {sorted(TARGET_COUNTRIES) if TARGET_COUNTRIES else '전체 자동 탐색'}")
+    print(f"{'='*60}")
 
-    print(f"\n{'='*55}")
-    print(f"[SAS → Parquet 변환] {DATA_FOLDER}")
-    print(f"  입력: {BASE_INPUT_DIR} / {COUNTRY}_{{year}}")
-    print(f"  출력: {OUTPUT_DIR}")
-    print(f"  대상 연도: {START_YEAR} ~ {END_YEAR}")
-    print(f"{'='*55}")
+    # 국가별 SAS 파일 목록 수집
+    groups = discover_country_groups(BASE_INPUT_DIR, TARGET_COUNTRIES)
 
-    for year in range(START_YEAR, END_YEAR + 1):
-        folder_name = f"{COUNTRY}_{year}"
-        input_folder = BASE_INPUT_DIR / folder_name
+    if not groups:
+        print("[오류] 변환할 폴더를 찾을 수 없습니다. BASE_INPUT_DIR을 확인하세요.")
+        return
 
-        if not input_folder.exists():
-            print(f"\n[건너뜀] 폴더를 찾을 수 없습니다: {input_folder}")
+    print(f"\n  발견된 국가: {sorted(groups.keys())}")
+
+    for country in sorted(groups.keys()):
+        sas_files = groups[country]
+
+        # 파일명에서 YYYYMM 범위 자동 산출
+        min_ym, max_ym = get_yyyymm_range(sas_files)
+        if not min_ym:
+            print(f"\n[건너뜀] {country}: 파일명에서 YYYYMM을 파싱할 수 없습니다.")
+            print(f"  파일명 예시: {sas_files[0].name}")
             continue
 
-        sas_files = sorted(list(input_folder.glob("*.sas7bdat")))
+        data_folder = f"{country}_{min_ym}_{max_ym}"
+        output_dir  = BASE_OUTPUT_DIR / data_folder
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not sas_files:
-            print(f"\n[안내] {folder_name} 폴더에 변환할 sas7bdat 파일이 없습니다.")
-            continue
+        print(f"\n{'='*60}")
+        print(f"[{country}] {len(sas_files)}개 파일  →  {data_folder}/")
+        print(f"{'='*60}")
 
-        print(f"\n{'='*50}")
-        print(f"[{year}년도] {len(sas_files)}개 파일 변환 시작")
-        print(f"{'='*50}")
-
+        country_processed = 0
         for sas_file in sas_files:
-            output_file = OUTPUT_DIR / f"{sas_file.stem}.parquet"
+            output_file = output_dir / f"{sas_file.stem}.parquet"
 
             if output_file.exists():
-                print(f"\n[스킵] 이미 변환된 파일이 존재합니다: {output_file.name}")
+                print(f"  [스킵] {output_file.name}")
                 continue
 
             convert_single_file(sas_file, output_file)
+            country_processed += 1
             total_files_processed += 1
 
+        print(f"\n  [{country} 완료] {country_processed}개 변환  |  출력: {output_dir}")
+
     total_end_time = time.time()
-    print(f"\n{'*'*55}")
-    print(f"[모든 작업 완료] 총 {total_files_processed}개의 파일 변환 성공!")
-    print(f"출력 폴더: {OUTPUT_DIR}")
+    print(f"\n{'*'*60}")
+    print(f"[모든 작업 완료] 총 {total_files_processed}개 파일 변환")
     print(f"총 소요 시간: {(total_end_time - total_start_time) / 60:.2f} 분")
-    print(f"{'*'*55}")
+    print(f"{'*'*60}")
 
 
 if __name__ == "__main__":

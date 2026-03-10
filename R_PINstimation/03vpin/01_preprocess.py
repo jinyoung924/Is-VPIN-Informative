@@ -1,7 +1,7 @@
 """
 =============================================================================
 [VPIN 파이프라인 - Step 1] Python 전처리
-틱 데이터 (월별 parquet) → 1분봉 집계 → all_1m_bars.parquet
+틱 데이터 (parquet 파일들) → 1분봉 집계 → all_1m_bars.parquet
 =============================================================================
 
 PIN/APIN과 달리 원시 가격·거래량이 필요하므로 별도 전처리를 수행한다.
@@ -75,8 +75,8 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "R_output", DATA_FOLDER, "vpin")
 # Step 1: 틱 데이터 → 1분봉
 # =============================================================================
 
-def process_one_month_to_1m_bars(parquet_path: str) -> pl.DataFrame:
-    """월별 틱 parquet 1개를 읽어 1분봉으로 집계한다."""
+def process_file_to_1m_bars(parquet_path: str) -> pl.DataFrame:
+    """틱 parquet 파일 1개를 읽어 1분봉으로 집계한다."""
     print(f"  Loading: {os.path.basename(parquet_path)} ...", end=" ", flush=True)
 
     df = (
@@ -137,14 +137,14 @@ def run_preprocessing(data_dir: str, output_dir: str) -> str:
 
     all_bars: List[pl.DataFrame] = []
     for path in parquet_files:
-        bars = process_one_month_to_1m_bars(path)
+        bars = process_file_to_1m_bars(path)
         if not bars.is_empty():
             all_bars.append(bars)
 
     if not all_bars:
         raise RuntimeError("[Error] 유효한 봉 데이터가 없습니다.")
 
-    print(f"\n  월별 봉 {len(all_bars)}개 병합 중...")
+    print(f"\n  파일 {len(all_bars)}개 병합 중...")
     full_bars = (
         pl.concat(all_bars, how="vertical")
         .sort(["Symbol", "Datetime"])

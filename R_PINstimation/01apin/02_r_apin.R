@@ -61,7 +61,7 @@ suppressPackageStartupMessages({
 # ★ 사용자 설정 구역 — 여기만 수정하면 됩니다
 # =============================================================================
 
-BASE_DIR <- "E:/vpin_project_parquet"
+BASE_DIR <- "E:/vpin_project_parquet/processing_data"
 COUNTRY  <- "KOR"
 
 WINDOW_SIZE    <- 60

@@ -75,7 +75,7 @@ suppressPackageStartupMessages({
 # =============================================================================
 
 # 틱 parquet 루트 폴더 (Python과 동일한 경로)
-BASE_DIR <- "E:/vpin_project_parquet"
+BASE_DIR <- "E:/vpin_project_parquet/processing_data"
 
 # 처리할 나라코드 (01_preprocess.py 의 COUNTRY 와 일치해야 함)
 COUNTRY <- "KOR"

@@ -1,7 +1,7 @@
 """
 =============================================================================
 [APIN 파이프라인 - Step 1+2] Python 전처리
-틱 데이터 (월별 parquet)
+틱 데이터 ({나라코드}_{연도} 폴더들)
   → Step 1: 일별 B/S 집계     → all_daily_bs.parquet   (PIN·APIN 공유 캐시)
   → Step 2: 영업일 캘린더 정렬 → full_daily_bs.parquet  (R 입력)
 =============================================================================
@@ -9,10 +9,17 @@
 PIN(00pin/)과 all_daily_bs.parquet·full_daily_bs.parquet 캐시를 공유한다.
 어느 쪽을 먼저 실행해도 기존 캐시를 자동으로 재사용한다.
 
-지원 입력 폴더 형식: {나라코드}_{시작연도월}_{종료연도월}
-  예) KOR_201910_202107  /  US_201901_202012  /  JP_202001_202312
+입력 폴더 형식: {BASE_DIR}/{나라코드}_{연도}/  ← SAS→parquet 출력 구조와 동일
+  예) E:\\vpin_project_parquet\\KOR_2019\\KOR_201901.parquet
+      E:\\vpin_project_parquet\\KOR_2020\\KOR_202001.parquet
+
+COUNTRY 설정만 바꾸면 해당 나라의 모든 연도 폴더를 자동으로 스캔한다.
 
 지원 나라코드: KOR  US  JP  CA  FR  GR  HK  IT  UK
+
+출력 경로: {BASE_DIR}/R_output/{COUNTRY}/
+  all_daily_bs.parquet   ← PIN·APIN 공유 캐시
+  full_daily_bs.parquet  ← R 입력
 
 실행 순서:
   1) python 01apin/01_preprocess.py
@@ -30,7 +37,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import warnings
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -45,9 +52,9 @@ warnings.filterwarnings("ignore")
 # 틱 parquet 루트 폴더
 BASE_DIR = r"E:\vpin_project_parquet"
 
-# 처리할 데이터 폴더명 (BASE_DIR 하위)
-# 형식: {나라코드}_{시작YYYYMM}_{종료YYYYMM}
-DATA_FOLDER = "KOR_201910_202107"
+# 처리할 나라코드 — 이 코드로 시작하는 모든 연도 폴더를 자동 스캔
+# 예) "KOR" → KOR_2019, KOR_2020, KOR_2021 ... 자동 탐색
+COUNTRY = "KOR"
 
 # True → 기존 캐시 파일이 있어도 강제 재생성
 FORCE_REPROCESS = False
@@ -57,23 +64,44 @@ FORCE_REPROCESS = False
 # =============================================================================
 
 VALID_COUNTRIES = {"KOR", "US", "JP", "CA", "FR", "GR", "HK", "IT", "UK"}
-_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{6})_(\d{6})$")
+_YEAR_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{4})$")
 
-def _parse_folder(folder: str):
-    m = _FOLDER_RE.match(folder)
-    if not m or m.group(1) not in VALID_COUNTRIES:
-        raise ValueError(
-            f"DATA_FOLDER 형식 오류: '{folder}'\n"
-            f"  올바른 형식: {{나라코드}}_{{YYYYMM}}_{{YYYYMM}}\n"
-            f"  예) KOR_201910_202107\n"
-            f"  지원 나라코드: {', '.join(sorted(VALID_COUNTRIES))}"
+if COUNTRY not in VALID_COUNTRIES:
+    raise ValueError(
+        f"COUNTRY 설정 오류: '{COUNTRY}'\n"
+        f"  지원 나라코드: {', '.join(sorted(VALID_COUNTRIES))}"
+    )
+
+CACHE_DIR = os.path.join(BASE_DIR, "R_output", COUNTRY)
+
+
+def get_country_folders(base_dir: str, country: str) -> List[str]:
+    """base_dir 하위에서 {country}_{연도} 패턴의 폴더를 모두 찾아 정렬 반환."""
+    folders = []
+    for entry in sorted(os.scandir(base_dir), key=lambda e: e.name):
+        if entry.is_dir():
+            m = _YEAR_FOLDER_RE.match(entry.name)
+            if m and m.group(1) == country:
+                folders.append(entry.path)
+    return folders
+
+
+def get_parquet_files(base_dir: str, country: str) -> List[str]:
+    folders = get_country_folders(base_dir, country)
+    if not folders:
+        raise RuntimeError(
+            f"[Error] '{country}_YYYY' 패턴의 폴더를 찾을 수 없습니다: {base_dir}"
         )
-    return m.group(1), m.group(2), m.group(3)
+    print(f"\n[파일 탐색] {base_dir}  (나라코드: {country})")
+    print(f"  연도 폴더 {len(folders)}개: {[os.path.basename(f) for f in folders]}")
 
-COUNTRY, PERIOD_START, PERIOD_END = _parse_folder(DATA_FOLDER)
-
-DATA_DIR  = os.path.join(BASE_DIR, DATA_FOLDER)
-CACHE_DIR = os.path.join(BASE_DIR, "R_output", DATA_FOLDER)
+    files = []
+    for folder in folders:
+        found = sorted(glob.glob(os.path.join(folder, "*.parquet")))
+        print(f"  {os.path.basename(folder)}: parquet {len(found)}개")
+        files.extend(found)
+    print(f"  합계: parquet {len(files)}개")
+    return files
 
 
 # =============================================================================
@@ -102,14 +130,7 @@ def preprocess_trade_data_polars(parquet_path: str) -> pl.DataFrame:
     return df
 
 
-def get_parquet_files(data_dir: str) -> List[str]:
-    files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-    print(f"\n[파일 탐색] {data_dir}")
-    print(f"  parquet {len(files)}개 발견")
-    return files
-
-
-def run_step1(data_dir: str, cache_dir: str) -> pl.DataFrame:
+def run_step1(base_dir: str, country: str, cache_dir: str) -> pl.DataFrame:
     """틱 parquet 전체를 순회하여 all_daily_bs.parquet로 집계한다."""
     os.makedirs(cache_dir, exist_ok=True)
     output_path = os.path.join(cache_dir, "all_daily_bs.parquet")
@@ -119,12 +140,10 @@ def run_step1(data_dir: str, cache_dir: str) -> pl.DataFrame:
         print(f"  (00pin/01_preprocess.py 가 생성한 공유 캐시)")
         return pl.read_parquet(output_path)
 
-    parquet_files = get_parquet_files(data_dir)
-    if not parquet_files:
-        raise RuntimeError(f"[Error] parquet 파일을 찾을 수 없습니다: {data_dir}")
+    parquet_files = get_parquet_files(base_dir, country)
 
     print(f"\n{'='*65}")
-    print(f"[Step 1] 틱 데이터 → 일별 B/S 집계  [{DATA_FOLDER}]")
+    print(f"[Step 1] 틱 데이터 → 일별 B/S 집계  [{country}]")
     print(f"{'='*65}\n")
 
     all_dfs = []
@@ -178,7 +197,7 @@ def run_step2(daily_bs: pl.DataFrame, cache_dir: str) -> str:
         return output_path
 
     print(f"\n{'='*65}")
-    print(f"[Step 2] 영업일 캘린더 정렬  [{DATA_FOLDER}]")
+    print(f"[Step 2] 영업일 캘린더 정렬  [{COUNTRY}]")
     print(f"{'='*65}")
 
     all_symbols = daily_bs["Symbol"].unique().sort().to_list()
@@ -239,16 +258,16 @@ if __name__ == "__main__":
     start = datetime.now()
     print(f"\n{'='*65}")
     print(f"[APIN 전처리] {start.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  데이터   : {DATA_FOLDER}  (나라: {COUNTRY}, 기간: {PERIOD_START}~{PERIOD_END})")
-    print(f"  입력     : {DATA_DIR}")
+    print(f"  나라코드 : {COUNTRY}")
+    print(f"  입력 루트: {BASE_DIR}  ({COUNTRY}_YYYY 폴더 자동 스캔)")
     print(f"  출력     : {CACHE_DIR}")
     print(f"{'='*65}")
 
-    if not os.path.isdir(DATA_DIR):
-        print(f"[Error] 입력 폴더가 없습니다: {DATA_DIR}")
+    if not os.path.isdir(BASE_DIR):
+        print(f"[Error] BASE_DIR이 없습니다: {BASE_DIR}")
         exit(1)
 
-    daily_bs = run_step1(DATA_DIR, CACHE_DIR)
+    daily_bs = run_step1(BASE_DIR, COUNTRY, CACHE_DIR)
     run_step2(daily_bs, CACHE_DIR)
 
     print(f"\n[완료] 소요 시간: {datetime.now() - start}")

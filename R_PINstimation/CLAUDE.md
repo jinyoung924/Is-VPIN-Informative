@@ -24,13 +24,14 @@ R의 `PINstimation` 패키지로 계산하는 연구용 파이프라인.
 
 ```
 R_PINstimation/
+├── 00_sas_to_parquet.py     ← SAS7BDAT → Parquet 변환 (폴더 구조 그대로 유지)
 ├── 00pin/
 │   ├── 01_preprocess.py     ← Step1: 틱→일별 B/S 집계, Step2: 캘린더 정렬
 │   └── 02_r_pin.R           ← 60일 롤링 PIN 추정 (R, 병렬)
 ├── 01apin/
 │   ├── 01_preprocess.py     ← 00pin과 공유 캐시 사용 (동일 로직)
 │   └── 02_r_apin.R          ← 60일 롤링 APIN 추정 (R, 병렬)
-├── 03vpin/
+├── 02vpin/
 │   ├── 01_preprocess.py     ← 틱→1분봉 집계
 │   └── 02_r_vpin.R          ← VPIN 추정 (R, 병렬)
 └── Base_code/               ← 원형 코드 (검증용 16종목 샘플 버전)
@@ -44,15 +45,21 @@ R_PINstimation/
 
 ### 3-1. 원본 틱 데이터 (BASE_DIR 하위)
 
+SAS→parquet 변환 후의 폴더 구조를 PIN/APIN/VPIN 파이프라인이 그대로 읽는다.
+
 ```
 E:\vpin_project_parquet\
-└── {DATA_FOLDER}\          예) KOR_201910_202107\
-    ├── 201910_ticks.parquet
-    ├── 201911_ticks.parquet
-    └── ...  (월 1파일)
+├── KOR_2019\
+│   ├── KOR_201901.parquet
+│   ├── KOR_201902.parquet
+│   └── ...  (월 1파일)
+├── KOR_2020\
+│   └── ...
+└── KOR_2021\
+    └── ...
 ```
 
-**폴더명 규칙**: `{나라코드}_{시작YYYYMM}_{종료YYYYMM}`
+**폴더명 규칙**: `{나라코드}_{연도}`  (SAS 원본 폴더명과 동일)
 
 지원 나라코드: `KOR`, `US`, `JP`, `CA`, `FR`, `GR`, `HK`, `IT`, `UK`
 
@@ -84,15 +91,15 @@ E:\vpin_project_parquet\
 
 **사용자 설정 구역** (파일 상단):
 ```python
-BASE_DIR    = r"E:\vpin_project_parquet"   # 틱 parquet 루트
-DATA_FOLDER = "KOR_201910_202107"          # {나라코드}_{YYYYMM}_{YYYYMM}
-FORCE_REPROCESS = False                    # True: 기존 캐시 무시하고 재생성
+BASE_DIR        = r"E:\vpin_project_parquet"   # 틱 parquet 루트
+COUNTRY         = "KOR"                        # 나라코드 → KOR_YYYY 폴더 자동 스캔
+FORCE_REPROCESS = False                        # True: 기존 캐시 무시하고 재생성
 ```
 
 **Step 1 — 틱 데이터 → 일별 B/S 집계**
 
 ```
-월별 parquet N개
+{COUNTRY}_YYYY 폴더 자동 스캔 → 월별 parquet N개
     ↓  Polars scan_parquet (lazy)
     ↓  LR 필터 (1 또는 -1만)
     ↓  group_by(Symbol, Date).agg(B=sum(LR==1), S=sum(LR==-1))
@@ -126,8 +133,8 @@ all_daily_bs.parquet
 
 | 파일 | 경로 | 스키마 |
 |------|------|--------|
-| `all_daily_bs.parquet` | `R_output/{DATA_FOLDER}/` | Symbol, Date, B(UInt32), S(UInt32) |
-| `full_daily_bs.parquet` | `R_output/{DATA_FOLDER}/` | Symbol, Date, B(Int32), S(Int32) |
+| `all_daily_bs.parquet` | `R_output/{COUNTRY}/` | Symbol, Date, B(UInt32), S(UInt32) |
+| `full_daily_bs.parquet` | `R_output/{COUNTRY}/` | Symbol, Date, B(Int32), S(Int32) |
 
 ---
 
@@ -138,7 +145,7 @@ all_daily_bs.parquet
 **사용자 설정 구역**:
 ```r
 BASE_DIR    <- "E:/vpin_project_parquet"
-DATA_FOLDER <- "KOR_201910_202107"
+COUNTRY <- "KOR"
 
 WINDOW_SIZE    <- 60     # 롤링 윈도우 크기 (영업일)
 MIN_VALID_DAYS <- 30     # 윈도우 내 실제 거래일(B+S>0) 최솟값
@@ -182,9 +189,9 @@ CHECKPOINT_N <- 100   # N 종목마다 진행 로그 출력
 
 | 파일 | 경로 |
 |------|------|
-| `checkpoints/sym_{Symbol}.parquet` | `R_output/{DATA_FOLDER}/pin/checkpoints/` |
-| `r_pin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.parquet` | `R_output/{DATA_FOLDER}/pin/` |
-| `r_pin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.csv` | `R_output/{DATA_FOLDER}/pin/` |
+| `checkpoints/sym_{Symbol}.parquet` | `R_output/{COUNTRY}/pin/checkpoints/` |
+| `pin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet` | `R_output/{COUNTRY}/pin/` |
+| `pin_{COUNTRY}_{YYYYMMDD_HHMM}.csv` | `R_output/{COUNTRY}/pin/` |
 
 **결과 스키마** (PIN):
 
@@ -214,7 +221,7 @@ PIN 전처리와 **완전히 동일한 로직**. `CACHE_DIR`이 같은 경로이
 사용자 설정:
 ```python
 BASE_DIR    = r"E:\vpin_project_parquet"
-DATA_FOLDER = "KOR_201910_202107"
+COUNTRY = "KOR"
 FORCE_REPROCESS = False
 ```
 
@@ -257,31 +264,31 @@ NUM_INITIAL_SETS   <- 20
 
 | 파일 | 경로 |
 |------|------|
-| `checkpoints/sym_{Symbol}.parquet` | `R_output/{DATA_FOLDER}/apin/checkpoints/` |
-| `r_apin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.parquet` | `R_output/{DATA_FOLDER}/apin/` |
-| `r_apin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.csv` | `R_output/{DATA_FOLDER}/apin/` |
+| `checkpoints/sym_{Symbol}.parquet` | `R_output/{COUNTRY}/apin/checkpoints/` |
+| `apin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet` | `R_output/{COUNTRY}/apin/` |
+| `apin_{COUNTRY}_{YYYYMMDD_HHMM}.csv` | `R_output/{COUNTRY}/apin/` |
 
 ---
 
-## 6. VPIN 파이프라인 (`03vpin/`)
+## 6. VPIN 파이프라인 (`02vpin/`)
 
 PIN·APIN과 달리 일별 B/S가 아니라 **원시 가격·거래량**이 필요하므로 별도 전처리를 수행한다.
 
-### 6-1. Python 전처리 (`03vpin/01_preprocess.py`)
+### 6-1. Python 전처리 (`02vpin/01_preprocess.py`)
 
-**실행**: `python 03vpin/01_preprocess.py`
+**실행**: `python 02vpin/01_preprocess.py`
 
 **사용자 설정**:
 ```python
-BASE_DIR    = r"E:\vpin_project_parquet"
-DATA_FOLDER = "KOR_201910_202107"
+BASE_DIR        = r"E:\vpin_project_parquet"
+COUNTRY         = "KOR"
 FORCE_REPROCESS = False
 ```
 
 **처리 흐름**:
 
 ```
-월별 parquet N개
+{COUNTRY}_YYYY 폴더 자동 스캔 → 월별 parquet N개
     ↓  Polars scan_parquet (lazy)
     ↓  컬럼 선택: Symbol, Date, Time, Price, Volume
     ↓  Volume > 0 필터
@@ -296,18 +303,18 @@ FORCE_REPROCESS = False
 
 | 파일 | 경로 | 스키마 |
 |------|------|--------|
-| `all_1m_bars.parquet` | `R_output/{DATA_FOLDER}/vpin/` | Symbol, Datetime, Price(Float64), Volume(Float64) |
+| `all_1m_bars.parquet` | `R_output/{COUNTRY}/vpin/` | Symbol, Datetime, Price(Float64), Volume(Float64) |
 
 ---
 
-### 6-2. R 추정 (`03vpin/02_r_vpin.R`)
+### 6-2. R 추정 (`02vpin/02_r_vpin.R`)
 
-**실행**: `Rscript 03vpin/02_r_vpin.R`
+**실행**: `Rscript 02vpin/02_r_vpin.R`
 
 **사용자 설정**:
 ```r
 BASE_DIR    <- "E:/vpin_project_parquet"
-DATA_FOLDER <- "KOR_201910_202107"
+COUNTRY <- "KOR"
 
 ROLLING_WINDOW  <- 50    # VPIN 롤링 버킷 수
 BUCKETS_PER_DAY <- 50    # 버킷 크기 V = ADV / BUCKETS_PER_DAY
@@ -343,18 +350,26 @@ TIMEBARSIZE     <- 1     # 1분봉 입력
 
 | 파일 | 경로 |
 |------|------|
-| `checkpoints/sym_{Symbol}.parquet` | `R_output/{DATA_FOLDER}/vpin/checkpoints/` |
-| `r_vpin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.parquet` | `R_output/{DATA_FOLDER}/vpin/` |
-| `r_vpin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.csv` | `R_output/{DATA_FOLDER}/vpin/` |
+| `checkpoints/sym_{Symbol}.parquet` | `R_output/{COUNTRY}/vpin/checkpoints/` |
+| `vpin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet` | `R_output/{COUNTRY}/vpin/` |
+| `vpin_{COUNTRY}_{YYYYMMDD_HHMM}.csv` | `R_output/{COUNTRY}/vpin/` |
 
 ---
 
-## 7. 전체 출력 폴더 구조
+## 7. 전체 폴더 구조
 
 ```
-E:\vpin_project_parquet\
+E:\vpin_project_parquet\          ← BASE_DIR
+│
+├── KOR_2019\                     ← SAS→parquet 출력 (연도별 폴더)
+│   ├── KOR_201901.parquet
+│   ├── KOR_201902.parquet
+│   └── ...
+├── KOR_2020\
+│   └── ...
+│
 └── R_output\
-    └── KOR_201910_202107\
+    └── KOR\                      ← COUNTRY별 출력 루트
         │
         ├── all_daily_bs.parquet          ← PIN·APIN 공유 캐시 (Step1 출력)
         ├── full_daily_bs.parquet         ← 캘린더 정렬 완료 (Step2 출력, R 입력)
@@ -362,23 +377,22 @@ E:\vpin_project_parquet\
         ├── pin\
         │   ├── checkpoints\
         │   │   ├── sym_A005930.parquet   ← 완료 종목별 체크포인트
-        │   │   ├── sym_A000660.parquet
         │   │   └── ...
-        │   ├── r_pin_KOR_201910_202107_20260310_1430.parquet  ← 최종 결과
-        │   └── r_pin_KOR_201910_202107_20260310_1430.csv
+        │   ├── pin_KOR_20260310_1430.parquet   ← 최종 결과 (모델·나라·완료일시)
+        │   └── pin_KOR_20260310_1430.csv
         │
         ├── apin\
         │   ├── checkpoints\
         │   │   └── sym_*.parquet
-        │   ├── r_apin_KOR_201910_202107_20260310_1430.parquet
-        │   └── r_apin_KOR_201910_202107_20260310_1430.csv
+        │   ├── apin_KOR_20260310_1430.parquet
+        │   └── apin_KOR_20260310_1430.csv
         │
         └── vpin\
             ├── all_1m_bars.parquet        ← VPIN 전처리 출력 (R 입력)
             ├── checkpoints\
             │   └── sym_*.parquet
-            ├── r_vpin_KOR_201910_202107_20260310_1430.parquet
-            └── r_vpin_KOR_201910_202107_20260310_1430.csv
+            ├── vpin_KOR_20260310_1430.parquet
+            └── vpin_KOR_20260310_1430.csv
 ```
 
 ---
@@ -449,8 +463,8 @@ Rscript 01apin/02_r_apin.R
 
 ### VPIN 계산
 ```bash
-python 03vpin/01_preprocess.py
-Rscript 03vpin/02_r_vpin.R
+python 02vpin/01_preprocess.py
+Rscript 02vpin/02_r_vpin.R
 ```
 
 ---
@@ -459,15 +473,16 @@ Rscript 03vpin/02_r_vpin.R
 
 최종 결과 파일명 규칙:
 ```
-r_{모델}_{DATA_FOLDER}_{완료일시}.{확장자}
+{모델}_{COUNTRY}_{완료일시}.{확장자}
 
-예) r_pin_KOR_201910_202107_20260310_1430.parquet
-    r_apin_US_202001_202312_20260315_0900.csv
-    r_vpin_JP_201901_202012_20260320_1200.parquet
+예) pin_KOR_20260310_1430.parquet
+    apin_US_20260315_0900.csv
+    vpin_JP_20260320_1200.parquet
 ```
 
-- `{DATA_FOLDER}` → 나라·기간 정보 포함
-- `{완료일시}` → `YYYYMMDD_HHMM` 형식 → 동일 데이터 재실행 시 이전 결과를 덮어쓰지 않음
+- `{모델}` → `pin` / `apin` / `vpin` — 파일명만 봐도 어떤 모델인지 즉시 식별
+- `{COUNTRY}` → 나라코드 — 어느 나라 데이터인지 식별
+- `{완료일시}` → `YYYYMMDD_HHMM` 형식 → 동일 나라 재실행 시 이전 결과를 덮어쓰지 않음
 
 ---
 

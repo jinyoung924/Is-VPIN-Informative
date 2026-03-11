@@ -1,19 +1,25 @@
 """
 =============================================================================
 [VPIN 파이프라인 - Step 1] Python 전처리
-틱 데이터 (parquet 파일들) → 1분봉 집계 → all_1m_bars.parquet
+틱 데이터 ({나라코드}_{연도} 폴더들) → 1분봉 집계 → all_1m_bars.parquet
 =============================================================================
 
 PIN/APIN과 달리 원시 가격·거래량이 필요하므로 별도 전처리를 수행한다.
 
-지원 입력 폴더 형식: {나라코드}_{시작연도월}_{종료연도월}
-  예) KOR_201910_202107  /  US_201901_202012  /  JP_202001_202312
+입력 폴더 형식: {BASE_DIR}/{나라코드}_{연도}/  ← SAS→parquet 출력 구조와 동일
+  예) E:\\vpin_project_parquet\\KOR_2019\\KOR_201901.parquet
+      E:\\vpin_project_parquet\\KOR_2020\\KOR_202001.parquet
+
+COUNTRY 설정만 바꾸면 해당 나라의 모든 연도 폴더를 자동으로 스캔한다.
 
 지원 나라코드: KOR  US  JP  CA  FR  GR  HK  IT  UK
 
+출력 경로: {BASE_DIR}/R_output/{COUNTRY}/vpin/
+  all_1m_bars.parquet  ← R 입력
+
 실행 순서:
-  1) python 03vpin/01_preprocess.py
-  2) Rscript 03vpin/02_r_vpin.R
+  1) python 02vpin/01_preprocess.py
+  2) Rscript 02vpin/02_r_vpin.R
 
 =============================================================================
 """
@@ -25,7 +31,7 @@ import glob
 import polars as pl
 import warnings
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -40,9 +46,9 @@ warnings.filterwarnings("ignore")
 # 틱 parquet 루트 폴더
 BASE_DIR = r"E:\vpin_project_parquet"
 
-# 처리할 데이터 폴더명 (BASE_DIR 하위)
-# 형식: {나라코드}_{시작YYYYMM}_{종료YYYYMM}
-DATA_FOLDER = "KOR_201910_202107"
+# 처리할 나라코드 — 이 코드로 시작하는 모든 연도 폴더를 자동 스캔
+# 예) "KOR" → KOR_2019, KOR_2020, KOR_2021 ... 자동 탐색
+COUNTRY = "KOR"
 
 # True → 기존 all_1m_bars.parquet 가 있어도 강제 재생성
 FORCE_REPROCESS = False
@@ -52,23 +58,44 @@ FORCE_REPROCESS = False
 # =============================================================================
 
 VALID_COUNTRIES = {"KOR", "US", "JP", "CA", "FR", "GR", "HK", "IT", "UK"}
-_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{6})_(\d{6})$")
+_YEAR_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{4})$")
 
-def _parse_folder(folder: str):
-    m = _FOLDER_RE.match(folder)
-    if not m or m.group(1) not in VALID_COUNTRIES:
-        raise ValueError(
-            f"DATA_FOLDER 형식 오류: '{folder}'\n"
-            f"  올바른 형식: {{나라코드}}_{{YYYYMM}}_{{YYYYMM}}\n"
-            f"  예) KOR_201910_202107\n"
-            f"  지원 나라코드: {', '.join(sorted(VALID_COUNTRIES))}"
+if COUNTRY not in VALID_COUNTRIES:
+    raise ValueError(
+        f"COUNTRY 설정 오류: '{COUNTRY}'\n"
+        f"  지원 나라코드: {', '.join(sorted(VALID_COUNTRIES))}"
+    )
+
+OUTPUT_DIR = os.path.join(BASE_DIR, "R_output", COUNTRY, "vpin")
+
+
+def get_country_folders(base_dir: str, country: str) -> List[str]:
+    """base_dir 하위에서 {country}_{연도} 패턴의 폴더를 모두 찾아 정렬 반환."""
+    folders = []
+    for entry in sorted(os.scandir(base_dir), key=lambda e: e.name):
+        if entry.is_dir():
+            m = _YEAR_FOLDER_RE.match(entry.name)
+            if m and m.group(1) == country:
+                folders.append(entry.path)
+    return folders
+
+
+def get_parquet_files(base_dir: str, country: str) -> List[str]:
+    folders = get_country_folders(base_dir, country)
+    if not folders:
+        raise RuntimeError(
+            f"[Error] '{country}_YYYY' 패턴의 폴더를 찾을 수 없습니다: {base_dir}"
         )
-    return m.group(1), m.group(2), m.group(3)
+    print(f"\n[파일 탐색] {base_dir}  (나라코드: {country})")
+    print(f"  연도 폴더 {len(folders)}개: {[os.path.basename(f) for f in folders]}")
 
-COUNTRY, PERIOD_START, PERIOD_END = _parse_folder(DATA_FOLDER)
-
-DATA_DIR   = os.path.join(BASE_DIR, DATA_FOLDER)
-OUTPUT_DIR = os.path.join(BASE_DIR, "R_output", DATA_FOLDER, "vpin")
+    files = []
+    for folder in folders:
+        found = sorted(glob.glob(os.path.join(folder, "*.parquet")))
+        print(f"  {os.path.basename(folder)}: parquet {len(found)}개")
+        files.extend(found)
+    print(f"  합계: parquet {len(files)}개")
+    return files
 
 
 # =============================================================================
@@ -110,14 +137,7 @@ def process_file_to_1m_bars(parquet_path: str) -> pl.DataFrame:
     return bars
 
 
-def get_parquet_files(data_dir: str) -> List[str]:
-    files = sorted(glob.glob(os.path.join(data_dir, "*.parquet")))
-    print(f"\n[파일 탐색] {data_dir}")
-    print(f"  parquet {len(files)}개 발견")
-    return files
-
-
-def run_preprocessing(data_dir: str, output_dir: str) -> str:
+def run_preprocessing(base_dir: str, country: str, output_dir: str) -> str:
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, "all_1m_bars.parquet")
 
@@ -126,12 +146,10 @@ def run_preprocessing(data_dir: str, output_dir: str) -> str:
         print(f"\n[Step 1 스킵] 기존 파일 재사용: {output_path}  ({n:,} 행)")
         return output_path
 
-    parquet_files = get_parquet_files(data_dir)
-    if not parquet_files:
-        raise RuntimeError(f"[Error] parquet 파일을 찾을 수 없습니다: {data_dir}")
+    parquet_files = get_parquet_files(base_dir, country)
 
     print(f"\n{'='*65}")
-    print(f"[Step 1] 틱 데이터 → 1분봉 집계  [{DATA_FOLDER}]")
+    print(f"[Step 1] 틱 데이터 → 1분봉 집계  [{country}]")
     print(f"  출력 경로: {output_path}")
     print(f"{'='*65}\n")
 
@@ -166,16 +184,16 @@ if __name__ == "__main__":
     start = datetime.now()
     print(f"\n{'='*65}")
     print(f"[VPIN 전처리] {start.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  데이터   : {DATA_FOLDER}  (나라: {COUNTRY}, 기간: {PERIOD_START}~{PERIOD_END})")
-    print(f"  입력     : {DATA_DIR}")
+    print(f"  나라코드 : {COUNTRY}")
+    print(f"  입력 루트: {BASE_DIR}  ({COUNTRY}_YYYY 폴더 자동 스캔)")
     print(f"  출력     : {OUTPUT_DIR}")
     print(f"{'='*65}")
 
-    if not os.path.isdir(DATA_DIR):
-        print(f"[Error] 입력 폴더가 없습니다: {DATA_DIR}")
+    if not os.path.isdir(BASE_DIR):
+        print(f"[Error] BASE_DIR이 없습니다: {BASE_DIR}")
         exit(1)
 
-    run_preprocessing(DATA_DIR, OUTPUT_DIR)
+    run_preprocessing(BASE_DIR, COUNTRY, OUTPUT_DIR)
 
     print(f"\n[완료] 소요 시간: {datetime.now() - start}")
-    print(f"\n다음 단계: Rscript 03vpin/02_r_vpin.R")
+    print(f"\n다음 단계: Rscript 02vpin/02_r_vpin.R")

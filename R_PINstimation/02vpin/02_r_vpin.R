@@ -2,24 +2,65 @@
 # [VPIN 전체계산] PINstimation::vpin() 추정
 # =============================================================================
 #
-# 모델: Easley et al.(2012) — Volume-Synchronized PIN
+# 모델: Easley et al.(2012) — Volume-Synchronized PIN (VPIN)
+#   날짜 기반이 아닌 거래량 버킷 기반 추정.
+#   ADV(일평균거래량) / BUCKETS_PER_DAY = 버킷 크기 V 를 자동 산출하고,
+#   BVC(Bulk Volume Classification)로 버킷을 매수·매도로 분류한 뒤
+#   ROLLING_WINDOW 개 버킷의 슬라이딩 평균으로 VPIN을 계산한다.
+#   결과 단위는 날짜(Date)가 아닌 버킷(BucketNo)·버킷 종료 시각(Datetime).
 #
-# 입력  : R_output/{DATA_FOLDER}/vpin/all_1m_bars.parquet  (01_preprocess.py 출력)
-# 출력  : R_output/{DATA_FOLDER}/vpin/
-#           r_vpin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.parquet  ← 나라·기간·완료일시 포함
-#           r_vpin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.csv
-#           checkpoints/sym_{Symbol}.parquet
+# ─── 입출력 ───────────────────────────────────────────────────────────────────
+# 입력  : R_output/{COUNTRY}/vpin/all_1m_bars.parquet  (01_preprocess.py 출력)
+#           · 스키마: Symbol(Utf8), Datetime(Datetime), Price(Float64), Volume(Float64)
+#           · 1분봉 집계 완료 (틱 → group_by_dynamic 1m)
+# 출력  : R_output/{COUNTRY}/vpin/
+#           vpin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet         ← 전체 추정 결과
+#           vpin_{COUNTRY}_{YYYYMMDD_HHMM}_sample1000.csv  ← 눈으로 확인용 1000행
+#           checkpoints/sym_{Symbol}.parquet               ← 종목별 체크포인트
 #
-# 실행:
-#   Rscript 03vpin/02_r_vpin.R
+# ─── 처리 흐름 ────────────────────────────────────────────────────────────────
+# [1] all_1m_bars.parquet 로드
+#       · Datetime → as.POSIXct(tz="Asia/Seoul") 변환
+# [2] 체크포인트 확인
+#       · checkpoints/sym_*.parquet 스캔 → 완료 종목 파악
+#       · remaining_syms = setdiff(all_symbols, completed_syms)
+# [3] 종목별 데이터 분할 + 워커 인자 구성
+#       · split(bars_df, Symbol) → 종목별 data.frame
+#       · 각 종목 args 리스트: sym_df, session_length, buckets_per_day, 등
+# [4] 병렬 추정 — makeCluster(PSOCK) + parLapply
+#       · 워커: vpin(data=..., sessionlength=SESSION_LENGTH,
+#                    buckets=BUCKETS_PER_DAY, window=ROLLING_WINDOW,
+#                    timebarsize=TIMEBARSIZE, verbose=FALSE)
+#       · S4 결과 객체에서 @data(버킷 단위 DataFrame) 또는 @vpin(벡터) 추출
+#         - @data 우선: timestamp·vpin 컬럼명을 소문자 변환 후 자동 탐색
+#         - @data 없으면 @vpin 벡터 사용 (Datetime=NA)
+#       · 완료 즉시 checkpoints/sym_{Symbol}.parquet 독립 저장
+# [5] 체크포인트 병합 → 최종 결과 저장
+#       · Arrow open_dataset + dplyr::compute() 방식 (메모리 효율)
+#         - lapply + do.call(rbind) 대비 피크 메모리 ~3배 절감
+#         - open_dataset: lazy 참조 (C++ 메모리, R 힙 미사용)
+#         - summarise + collect(): 요약 통계를 작은 집계만 R로 가져옴
+#         - arrange + compute(): Arrow C++ 에서 정렬 후 Arrow Table 반환
+#         - write_parquet: Arrow Table을 스트리밍으로 파일에 씀
+#       · parquet(전체) + CSV(샘플 1000행) 저장
 #
-# 의존 패키지 (최초 1회):
-#   install.packages(c("PINstimation", "arrow", "parallel"))
+# ─── VPIN이 OOM 위험을 가지는 이유 ──────────────────────────────────────────
+#   날짜 기반 PIN/APIN은 4,000종목 × 400영업일 ≈ 152만 행이지만,
+#   VPIN은 버킷 기반으로 종목당 수천~수만 버킷 → 전체 수천만 행이 될 수 있다.
+#   lapply + rbind는 전체 데이터 복사본을 생성해 피크 메모리가 2배에 달하므로
+#   Arrow 스트리밍 병합을 사용한다.
+#
+# ─── 실행 ─────────────────────────────────────────────────────────────────────
+#   Rscript 02vpin/02_r_vpin.R
+#
+# ─── 의존 패키지 (최초 1회) ───────────────────────────────────────────────────
+#   install.packages(c("PINstimation", "arrow", "dplyr", "parallel"))
 # =============================================================================
 
 suppressPackageStartupMessages({
   library(PINstimation)
   library(arrow)
+  library(dplyr)     # open_dataset 스트리밍 집계에 필요
   library(parallel)
 })
 
@@ -28,8 +69,8 @@ suppressPackageStartupMessages({
 # ★ 사용자 설정 구역 — 여기만 수정하면 됩니다
 # =============================================================================
 
-BASE_DIR    <- "E:/vpin_project_parquet"
-DATA_FOLDER <- "KOR_201910_202107"
+BASE_DIR <- "E:/vpin_project_parquet"
+COUNTRY  <- "KOR"
 
 ROLLING_WINDOW  <- 50
 BUCKETS_PER_DAY <- 50
@@ -43,18 +84,14 @@ CHECKPOINT_N <- 100
 # (이하 수정 불필요)
 # =============================================================================
 
-INPUT_PATH     <- file.path(BASE_DIR, "R_output", DATA_FOLDER, "vpin", "all_1m_bars.parquet")
-OUTPUT_DIR     <- file.path(BASE_DIR, "R_output", DATA_FOLDER, "vpin")
+INPUT_PATH     <- file.path(BASE_DIR, "R_output", COUNTRY, "vpin", "all_1m_bars.parquet")
+OUTPUT_DIR     <- file.path(BASE_DIR, "R_output", COUNTRY, "vpin")
 CHECKPOINT_DIR <- file.path(OUTPUT_DIR, "checkpoints")
 dir.create(CHECKPOINT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-folder_parts <- strsplit(DATA_FOLDER, "_")[[1]]
-COUNTRY      <- folder_parts[1]
-PERIOD       <- paste(folder_parts[-1], collapse = "_")
-
 cat(sprintf("\n%s\n[VPIN 전체계산] 시작: %s\n%s\n",
             strrep("=", 65), format(Sys.time(), "%Y-%m-%d %H:%M:%S"), strrep("=", 65)))
-cat(sprintf("  데이터         : %s  (나라: %s, 기간: %s)\n", DATA_FOLDER, COUNTRY, PERIOD))
+cat(sprintf("  나라코드       : %s\n", COUNTRY))
 cat(sprintf("  INPUT_PATH     : %s\n", INPUT_PATH))
 cat(sprintf("  OUTPUT_DIR     : %s\n", OUTPUT_DIR))
 cat(sprintf("  롤링 윈도우    : %d 버킷  |  하루 버킷: %d  |  세션: %.1f시간\n",
@@ -212,6 +249,18 @@ if (length(remaining_syms) > 0) {
 
 # =============================================================================
 # [5] 체크포인트 병합 → 최종 결과 저장
+#
+# VPIN은 버킷 기반으로 수천만 행이 될 수 있다.
+# lapply + do.call(rbind) 방식은 rbind 시 전체 데이터 복사본을 생성해
+# 피크 메모리가 실제 데이터 크기의 2배에 달하므로 OOM 위험이 있다.
+#
+# → Arrow open_dataset + dplyr::compute() 방식으로 대체:
+#     open_dataset : 파일 목록을 지연(lazy) 참조 — 아직 메모리 로드 없음
+#     dplyr::arrange + compute() : Arrow C++ 메모리에서 정렬 후 Arrow Table 반환
+#                                  R 힙을 거치지 않아 메모리 약 3배 절감
+#     write_parquet : Arrow Table을 스트리밍으로 파일에 씀
+#     집계 통계     : 별도 lazy 집계로 계산 — 전체 데이터 R로 가져오지 않음
+#     샘플 CSV      : head(1000) + collect() 로 1000행만 R로 가져와 저장
 # =============================================================================
 
 cat(sprintf("\n[5] 체크포인트 병합 중...\n"))
@@ -219,35 +268,73 @@ cat(sprintf("\n[5] 체크포인트 병합 중...\n"))
 all_ckpt_files <- list.files(CHECKPOINT_DIR, pattern = "^sym_.*\\.parquet$", full.names = TRUE)
 cat(sprintf("  체크포인트 파일 수: %d개\n", length(all_ckpt_files)))
 
-all_dfs   <- lapply(all_ckpt_files, function(f) tryCatch(arrow::read_parquet(f), error = function(e) NULL))
-non_empty <- Filter(function(df) !is.null(df) && nrow(df) > 0, all_dfs)
-
-if (length(non_empty) == 0) {
+if (length(all_ckpt_files) == 0) {
   cat("[Warning] 추정 결과가 없습니다.\n")
 } else {
-  final_df           <- do.call(rbind, non_empty)
-  rownames(final_df) <- NULL
-  final_df           <- final_df[order(final_df$Symbol, final_df$Datetime), ]
 
-  run_id       <- format(Sys.time(), "%Y%m%d_%H%M")
-  result_stem  <- sprintf("r_vpin_%s_%s", DATA_FOLDER, run_id)
-  csv_path     <- file.path(OUTPUT_DIR, paste0(result_stem, ".csv"))
-  parquet_path <- file.path(OUTPUT_DIR, paste0(result_stem, ".parquet"))
+  # open_dataset: 파일 목록을 lazy 참조 (메모리 로드 없음)
+  ckpt_ds <- tryCatch(
+    arrow::open_dataset(CHECKPOINT_DIR, format = "parquet"),
+    error = function(e) { cat(sprintf("[Error] 데이터셋 열기 실패: %s\n", e$message)); NULL }
+  )
 
-  write.csv(final_df, csv_path, row.names = FALSE)
-  arrow::write_parquet(final_df, parquet_path, compression = "zstd")
+  if (is.null(ckpt_ds)) {
+    cat("[Warning] 추정 결과를 열 수 없습니다.\n")
+  } else {
 
-  vpin_ok <- final_df$VPIN[!is.na(final_df$VPIN)]
-  cat(sprintf("\n%s\n[결과 요약]\n%s\n", strrep("=", 65), strrep("=", 65)))
-  cat(sprintf("  데이터      : %s  (나라: %s, 기간: %s)\n", DATA_FOLDER, COUNTRY, PERIOD))
-  cat(sprintf("  전체 버킷 수: %s\n", format(nrow(final_df), big.mark = ",")))
-  cat(sprintf("  완료 종목   : %d개 / 전체 %d개\n",
-              length(unique(final_df$Symbol)), n_total))
-  if (length(vpin_ok) > 0)
-    cat(sprintf("  VPIN 범위   : %.6f ~ %.6f  (평균 %.6f)\n",
-                min(vpin_ok), max(vpin_ok), mean(vpin_ok)))
-  cat(sprintf("\n  CSV     : %s\n", csv_path))
-  cat(sprintf("  parquet : %s\n", parquet_path))
-  cat(sprintf("  체크포인트: %s\n", CHECKPOINT_DIR))
-  cat(sprintf("%s\n", strrep("=", 65)))
+    # 요약 통계: lazy 집계 — 전체 데이터를 R로 가져오지 않음
+    stats <- tryCatch(
+      ckpt_ds |>
+        summarise(
+          n_rows    = n(),
+          n_syms    = n_distinct(Symbol),
+          vpin_min  = min(VPIN, na.rm = TRUE),
+          vpin_max  = max(VPIN, na.rm = TRUE),
+          vpin_mean = mean(VPIN, na.rm = TRUE)
+        ) |>
+        collect(),
+      error = function(e) NULL
+    )
+
+    if (is.null(stats) || stats$n_rows == 0) {
+      cat("[Warning] 추정 결과가 없습니다.\n")
+    } else {
+
+      run_id       <- format(Sys.time(), "%Y%m%d_%H%M")
+      result_stem  <- sprintf("vpin_%s_%s", COUNTRY, run_id)
+      parquet_path <- file.path(OUTPUT_DIR, paste0(result_stem, ".parquet"))
+      csv_path     <- file.path(OUTPUT_DIR, paste0(result_stem, "_sample1000.csv"))
+
+      cat(sprintf("  총 버킷 수 : %s행\n", format(stats$n_rows, big.mark = ",")))
+      cat(sprintf("  Arrow 스트리밍 병합 시작...\n"))
+
+      # Arrow compute(): R 힙 대신 Arrow C++ 메모리에서 정렬·병합
+      # do.call(rbind) 대비 피크 메모리 ~3배 절감
+      result_tbl <- ckpt_ds |>
+        arrange(Symbol, Datetime) |>
+        compute()
+
+      arrow::write_parquet(result_tbl, parquet_path, compression = "zstd")
+      rm(result_tbl); gc()
+
+      # 샘플 CSV: Arrow lazy 쿼리에서 1000행만 R로 가져와 저장
+      sample_df <- ckpt_ds |>
+        arrange(Symbol, Datetime) |>
+        head(1000) |>
+        collect()
+      write.csv(sample_df, csv_path, row.names = FALSE)
+      rm(sample_df)
+
+      cat(sprintf("\n%s\n[결과 요약]\n%s\n", strrep("=", 65), strrep("=", 65)))
+      cat(sprintf("  나라코드    : %s\n", COUNTRY))
+      cat(sprintf("  전체 버킷 수: %s\n", format(stats$n_rows, big.mark = ",")))
+      cat(sprintf("  완료 종목   : %d개 / 전체 %d개\n", stats$n_syms, n_total))
+      cat(sprintf("  VPIN 범위   : %.6f ~ %.6f  (평균 %.6f)\n",
+                  stats$vpin_min, stats$vpin_max, stats$vpin_mean))
+      cat(sprintf("\n  parquet (전체)     : %s\n", parquet_path))
+      cat(sprintf("  CSV (샘플 1000행)  : %s\n", csv_path))
+      cat(sprintf("  체크포인트         : %s\n", CHECKPOINT_DIR))
+      cat(sprintf("%s\n", strrep("=", 65)))
+    }
+  }
 }

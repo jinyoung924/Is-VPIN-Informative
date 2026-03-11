@@ -49,6 +49,7 @@ SAS7BDAT → Parquet 배치 변환 스크립트
    →  E:\\vpin_project_parquet\\KOR_2019\\KOR_201901.parquet
 """
 
+import re
 import pyreadstat
 import pandas as pd
 import pyarrow as pa
@@ -67,6 +68,13 @@ BASE_INPUT_DIR  = Path(r"E:\vpin_project_sas7bdat")
 BASE_OUTPUT_DIR = Path(r"E:\vpin_project_parquet")
 
 CHUNK_SIZE = 5_000_000  # 500만 행 단위
+
+# ==========================================
+# (이하 수정 불필요)
+# ==========================================
+
+# 입력 폴더명 패턴: {나라코드}_{연도}  예) KOR_2019, US_2020
+_FOLDER_RE = re.compile(r"^([A-Z]+)_(\d{4})$")
 
 
 def process_chunk_for_polars(df: pd.DataFrame) -> pd.DataFrame:
@@ -255,7 +263,8 @@ def run_batch_conversion() -> None:
     print(f"  출력 루트: {BASE_OUTPUT_DIR}")
     print(f"{'='*60}")
 
-    folders = sorted(p for p in BASE_INPUT_DIR.iterdir() if p.is_dir())
+    folders = sorted(p for p in BASE_INPUT_DIR.iterdir()
+                     if p.is_dir() and _FOLDER_RE.match(p.name))
     if not folders:
         print("[오류] 하위 폴더를 찾을 수 없습니다. BASE_INPUT_DIR을 확인하세요.")
         return

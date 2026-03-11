@@ -2,26 +2,64 @@
 # [PIN 전체계산] PINstimation::pin() 롤링 추정
 # =============================================================================
 #
+# ── 개요 ─────────────────────────────────────────────────────────────────────
 # 모델: EKOP(1996) — 5개 파라미터 (alpha, delta, mu, eps.b, eps.s)
+# 방법: 60영업일 롤링 윈도우를 전 종목·전 기간에 걸쳐 병렬로 추정한다.
 #
-# 입력  : R_output/{DATA_FOLDER}/full_daily_bs.parquet  (01_preprocess.py 출력)
-# 출력  : R_output/{DATA_FOLDER}/pin/
-#           r_pin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.parquet   ← 나라·기간·완료일시 포함
-#           r_pin_{DATA_FOLDER}_{YYYYMMDD_HHMM}.csv
-#           checkpoints/sym_{Symbol}.parquet               ← 종목별 체크포인트
+# ── 입출력 ───────────────────────────────────────────────────────────────────
+# 입력 : R_output/{COUNTRY}/full_daily_bs.parquet
+#          └─ 01_preprocess.py Step2 출력.
+#             전 종목·전 영업일에 대해 일별 매수(B)·매도(S) 수량이 정렬된 상태.
+#             거래 없는 날은 B=S=0 행이 삽입되어 있어 60행 = 정확히 60 영업일.
+# 출력 : R_output/{COUNTRY}/pin/
+#          ├─ pin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet       ← 전체 결과 (주 출력)
+#          ├─ pin_{COUNTRY}_{YYYYMMDD_HHMM}_sample1000.csv ← 눈으로 확인용
+#          └─ checkpoints/sym_{Symbol}.parquet             ← 종목별 중간 저장
 #
-# 체크포인트 / 중단 재개:
-#   종목 완료마다 checkpoints/sym_{Symbol}.parquet 저장.
-#   재실행 시 기존 파일이 있는 종목은 자동으로 건너뜀.
+# ── 실행 흐름 ────────────────────────────────────────────────────────────────
+# [1] full_daily_bs.parquet 로드
+#       전 종목의 일별 B/S 데이터를 메모리에 올린다.
 #
-# 병렬 처리:
-#   전체 CPU 코어 사용. 한 코어 = 한 종목 전체 기간.
-#   워커는 각자 별도 파일에 저장 → 레이스컨디션 없음.
+# [2] 체크포인트 확인 (중단 재개)
+#       checkpoints/sym_*.parquet 파일 목록을 스캔해 완료 종목을 파악한다.
+#       remaining_syms = 전체 종목 - 완료 종목 → 재실행 시 이어서 진행.
 #
-# 실행:
+# [3] 종목별 데이터 분할
+#       daily_bs를 Symbol 기준으로 분리해 워커에 넘길 args 리스트를 구성한다.
+#
+# [4] 병렬 추정 — makeCluster(PSOCK) + parLapply
+#       워커 1개 = 종목 1개의 전체 기간 처리.
+#       각 워커 내부 루프 (i = WINDOW_SIZE ~ n_days, 1행씩 슬라이딩):
+#         window_B/S  = [i-WINDOW_SIZE+1 ~ i] 구간의 60영업일 슬라이스
+#         valid_days  = 윈도우 내 B+S>0인 날 수
+#         valid_days < MIN_VALID_DAYS → 스킵  (거래 희박 구간 제외)
+#         pin() 수렴 실패(error) → 스킵
+#         수렴 성공 → (Symbol, Date, valid_days, a,d,u,eb,es, PIN) 행 추가
+#       워커 완료 즉시 checkpoints/sym_{Symbol}.parquet 저장.
+#       각 워커가 독립 파일에 쓰므로 레이스컨디션 없음.
+#       CHECKPOINT_N 종목마다 진행률·ETA 로그 출력.
+#
+# [5] 체크포인트 병합 → 최종 저장
+#       checkpoints/sym_*.parquet 전부 rbind → Symbol·Date 정렬.
+#       parquet (전체 결과) + CSV (상위 1000행 샘플) 저장.
+#       PIN 결과는 최대 ~152만 행 수준으로 rbind 피크 메모리 ~400 MB 이내.
+#
+# ── 체크포인트 설계 ──────────────────────────────────────────────────────────
+# 1종목이 완료될 때마다 즉시 개별 파일로 저장하는 이유:
+#   - 수천 종목 계산 중 언제든 중단되어도 완료분은 보존됨
+#   - 재실행 시 remaining_syms만 계산하므로 중복 연산 없음
+#   - 워커별 파일 분리로 동시 쓰기 충돌(레이스컨디션) 원천 방지
+#
+# ── 캘린더 정렬이 필요한 이유 ────────────────────────────────────────────────
+# 원본 틱 데이터에는 거래가 없는 날의 행이 존재하지 않는다.
+# 정렬 없이 60행 롤링을 잡으면 "60행 = 실제로는 여러 달"이 될 수 있다.
+# 01_preprocess.py Step2에서 거래 없는 날에 B=S=0 행을 삽입했으므로
+# 이 스크립트의 60행은 항상 정확히 60 영업일을 의미한다.
+#
+# ── 실행 ─────────────────────────────────────────────────────────────────────
 #   Rscript 00pin/02_r_pin.R
 #
-# 의존 패키지 (최초 1회):
+# ── 의존 패키지 (최초 1회) ───────────────────────────────────────────────────
 #   install.packages(c("PINstimation", "arrow", "parallel"))
 # =============================================================================
 
@@ -39,9 +77,8 @@ suppressPackageStartupMessages({
 # 틱 parquet 루트 폴더 (Python과 동일한 경로)
 BASE_DIR <- "E:/vpin_project_parquet"
 
-# 처리할 데이터 폴더명 (01_preprocess.py 의 DATA_FOLDER 와 일치해야 함)
-# 형식: {나라코드}_{시작YYYYMM}_{종료YYYYMM}
-DATA_FOLDER <- "KOR_201910_202107"
+# 처리할 나라코드 (01_preprocess.py 의 COUNTRY 와 일치해야 함)
+COUNTRY <- "KOR"
 
 # ── 롤링 윈도우 파라미터 ──────────────────────────────────────────────────────
 WINDOW_SIZE    <- 60   # 롤링 윈도우 크기 (영업일)
@@ -60,19 +97,14 @@ CHECKPOINT_N <- 100   # N 종목마다 진행 로그 출력
 # (이하 수정 불필요) — 경로 자동 생성
 # =============================================================================
 
-INPUT_PATH     <- file.path(BASE_DIR, "R_output", DATA_FOLDER, "full_daily_bs.parquet")
-OUTPUT_DIR     <- file.path(BASE_DIR, "R_output", DATA_FOLDER, "pin")
+INPUT_PATH     <- file.path(BASE_DIR, "R_output", COUNTRY, "full_daily_bs.parquet")
+OUTPUT_DIR     <- file.path(BASE_DIR, "R_output", COUNTRY, "pin")
 CHECKPOINT_DIR <- file.path(OUTPUT_DIR, "checkpoints")
 dir.create(CHECKPOINT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-# DATA_FOLDER에서 나라코드·기간 파싱 (로그·파일명용)
-folder_parts <- strsplit(DATA_FOLDER, "_")[[1]]
-COUNTRY      <- folder_parts[1]
-PERIOD       <- paste(folder_parts[-1], collapse = "_")   # "201910_202107"
-
 cat(sprintf("\n%s\n[PIN 전체계산] 시작: %s\n%s\n",
             strrep("=", 65), format(Sys.time(), "%Y-%m-%d %H:%M:%S"), strrep("=", 65)))
-cat(sprintf("  데이터      : %s  (나라: %s, 기간: %s)\n", DATA_FOLDER, COUNTRY, PERIOD))
+cat(sprintf("  나라코드    : %s\n", COUNTRY))
 cat(sprintf("  INPUT_PATH  : %s\n", INPUT_PATH))
 cat(sprintf("  OUTPUT_DIR  : %s\n", OUTPUT_DIR))
 cat(sprintf("  윈도우 크기 : %d영업일  |  최소 유효일: %d일\n", WINDOW_SIZE, MIN_VALID_DAYS))
@@ -254,17 +286,17 @@ if (length(non_empty) == 0) {
   rownames(final_df) <- NULL
   final_df           <- final_df[order(final_df$Symbol, final_df$Date), ]
 
-  # 파일명: r_pin_{DATA_FOLDER}_{완료일시}.parquet
   run_id       <- format(Sys.time(), "%Y%m%d_%H%M")
-  result_stem  <- sprintf("r_pin_%s_%s", DATA_FOLDER, run_id)
-  csv_path     <- file.path(OUTPUT_DIR, paste0(result_stem, ".csv"))
+  result_stem  <- sprintf("pin_%s_%s", COUNTRY, run_id)
   parquet_path <- file.path(OUTPUT_DIR, paste0(result_stem, ".parquet"))
+  csv_path     <- file.path(OUTPUT_DIR, paste0(result_stem, "_sample1000.csv"))
 
-  write.csv(final_df, csv_path, row.names = FALSE)
   arrow::write_parquet(final_df, parquet_path, compression = "zstd")
+  write.csv(head(final_df, 1000), csv_path, row.names = FALSE)
 
   cat(sprintf("\n%s\n[결과 요약]\n%s\n", strrep("=", 65), strrep("=", 65)))
-  cat(sprintf("  데이터      : %s  (나라: %s, 기간: %s)\n", DATA_FOLDER, COUNTRY, PERIOD))
+  cat(sprintf("  나라코드    : %s\n", COUNTRY))
+  cat(sprintf("  날짜 범위   : %s ~ %s\n", min(final_df$Date), max(final_df$Date)))
   cat(sprintf("  전체 레코드 : %s\n", format(nrow(final_df), big.mark = ",")))
   cat(sprintf("  완료 종목   : %d개 / 전체 %d개\n",
               length(unique(final_df$Symbol)), n_total))
@@ -272,8 +304,8 @@ if (length(non_empty) == 0) {
               min(final_df$PIN, na.rm = TRUE),
               max(final_df$PIN, na.rm = TRUE),
               mean(final_df$PIN, na.rm = TRUE)))
-  cat(sprintf("\n  CSV     : %s\n", csv_path))
-  cat(sprintf("  parquet : %s\n", parquet_path))
-  cat(sprintf("  체크포인트: %s\n", CHECKPOINT_DIR))
+  cat(sprintf("\n  parquet (전체)     : %s\n", parquet_path))
+  cat(sprintf("  CSV (샘플 1000행)  : %s\n", csv_path))
+  cat(sprintf("  체크포인트         : %s\n", CHECKPOINT_DIR))
   cat(sprintf("%s\n", strrep("=", 65)))
 }

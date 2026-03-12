@@ -3,8 +3,18 @@
 # =============================================================================
 #
 # ── 개요 ─────────────────────────────────────────────────────────────────────
-# 모델: EKOP(1996) — 5개 파라미터 (alpha, delta, mu, eps.b, eps.s)
+# 모델: EKOP(1996) — 5개 파라미터 (alpha, delta, mu, epsilon.b, epsilon.s)
 # 방법: 60영업일 롤링 윈도우를 전 종목·전 기간에 걸쳐 병렬로 추정한다.
+#
+# ── 버그 수정 내역 ────────────────────────────────────────────────────────────
+# [수정 1] pin() 에 존재하지 않는 num_init 파라미터 제거
+#   - PINstimation::pin() 시그니처: pin(data, method, initialsets, verbose)
+#   - num_init 을 넘기면 "unused argument" 에러 → converged=FALSE → 결과 0건
+#   - NUM_INITIAL_SETS 설정값 및 num_init 인자 전달 코드를 모두 제거함
+#
+# [수정 2] @parameters 슬롯의 키 이름 오류 수정
+#   - 잘못된 키: "eps.b", "eps.s"  →  올바른 키: "epsilon.b", "epsilon.s"
+#   - 기존 코드에서는 eb/es 컬럼이 항상 NA로 저장되는 문제가 있었음
 #
 # ── 입출력 ───────────────────────────────────────────────────────────────────
 # 입력 : R_output/{COUNTRY}/full_daily_bs.parquet
@@ -85,9 +95,10 @@ WINDOW_SIZE    <- 60   # 롤링 윈도우 크기 (영업일)
 MIN_VALID_DAYS <- 30   # 윈도우 내 실제 거래일(B+S>0) 최솟값
 
 # ── PINstimation::pin() 파라미터 ──────────────────────────────────────────────
-PIN_METHOD       <- "ML"   # "ML" 또는 "ECM"
-PIN_INITIALSETS  <- "GE"   # "GE", "random" 등
-NUM_INITIAL_SETS <- 20
+# pin() 시그니처: pin(data, method, initialsets, verbose)
+# ※ num_init 파라미터는 pin()에 존재하지 않으므로 설정하지 않음
+PIN_METHOD      <- "ML"   # "ML" 또는 "ECM"
+PIN_INITIALSETS <- "GE"   # "GE", "random" 등
 
 # ── 병렬 설정 ─────────────────────────────────────────────────────────────────
 NUM_WORKERS  <- parallel::detectCores(logical = TRUE)
@@ -108,8 +119,7 @@ cat(sprintf("  나라코드    : %s\n", COUNTRY))
 cat(sprintf("  INPUT_PATH  : %s\n", INPUT_PATH))
 cat(sprintf("  OUTPUT_DIR  : %s\n", OUTPUT_DIR))
 cat(sprintf("  윈도우 크기 : %d영업일  |  최소 유효일: %d일\n", WINDOW_SIZE, MIN_VALID_DAYS))
-cat(sprintf("  Method      : %s  |  InitSets: %s (%d세트)\n",
-            PIN_METHOD, PIN_INITIALSETS, NUM_INITIAL_SETS))
+cat(sprintf("  Method      : %s  |  InitSets: %s\n", PIN_METHOD, PIN_INITIALSETS))
 cat(sprintf("  CPU 코어    : %d개  |  로그 간격: %d종목\n", NUM_WORKERS, CHECKPOINT_N))
 
 
@@ -167,19 +177,23 @@ worker_process_symbol <- function(args) {
   min_valid_days <- args$min_valid_days
   method         <- args$method
   initialsets    <- args$initialsets
-  num_init       <- args$num_init
 
   n_days <- nrow(sym_df)
 
+  # [수정 1] num_init 인자 제거 — pin()에 존재하지 않는 파라미터이므로 삭제
+  # [수정 2] @parameters 키를 "epsilon.b" / "epsilon.s" 로 수정
   estimate_window <- function(window_df) {
     tryCatch({
       res    <- pin(data = window_df, method = method,
-                    initialsets = initialsets, num_init = num_init,
+                    initialsets = initialsets,
                     verbose = FALSE)
       params <- res@parameters
-      list(a = as.numeric(params["alpha"]), d = as.numeric(params["delta"]),
-           u = as.numeric(params["mu"]),    eb = as.numeric(params["eps.b"]),
-           es = as.numeric(params["eps.s"]), PIN = as.numeric(res@pin),
+      list(a  = as.numeric(params["alpha"]),
+           d  = as.numeric(params["delta"]),
+           u  = as.numeric(params["mu"]),
+           eb = as.numeric(params["epsilon.b"]),
+           es = as.numeric(params["epsilon.s"]),
+           PIN = as.numeric(res@pin),
            converged = TRUE)
     }, error = function(e) list(converged = FALSE))
   }
@@ -226,8 +240,7 @@ if (length(remaining_syms) > 0) {
     rows <- rows[order(rows$Date), ]
     list(sym_df = rows, symbol = sym, checkpoint_dir = CHECKPOINT_DIR,
          window_size = WINDOW_SIZE, min_valid_days = MIN_VALID_DAYS,
-         method = PIN_METHOD, initialsets = PIN_INITIALSETS,
-         num_init = NUM_INITIAL_SETS)
+         method = PIN_METHOD, initialsets = PIN_INITIALSETS)
   })
   cat("  분할 완료\n")
 

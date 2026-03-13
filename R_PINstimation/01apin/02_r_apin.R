@@ -94,9 +94,8 @@ suppressPackageStartupMessages({
 # ★ 사용자 설정 구역 — 여기만 수정하면 됩니다
 # =============================================================================
 
-BASE_DIR <- "E:/vpin_project_parquet/processing_data"
+BASE_DIR <- "C:/vpin_project/vpin_project_parquet/processing_data"
 COUNTRY  <- "KOR"
-
 # ── 롤링 윈도우 파라미터 ──────────────────────────────────────────────────────
 WINDOW_SIZE    <- 60   # 롤링 윈도우 크기 (영업일)
 MIN_VALID_DAYS <- 30   # 윈도우 내 실제 거래일(B+S>0) 최솟값

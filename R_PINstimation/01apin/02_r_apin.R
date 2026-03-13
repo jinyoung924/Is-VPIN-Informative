@@ -13,10 +13,16 @@
 #   data        : {B, S} 열을 포함하는 data.frame (일별 매수·매도 건수)
 #   method      : "ECM" (기본) 또는 "ML"
 #   initialsets : "GE" | "CL" | "RANDOM" 또는 사용자 정의 data.frame
-#                   ← data.frame 형식: 10열 (α, δ, θ, θ', εb, εs, μb, μs, Δb, Δs)
-#                   ← 이전 윈도우 추정 파라미터를 직접 넘겨 warm-start 가능
 #   num_init    : GE·CL·RANDOM 방식일 때 생성할 초기점 개수 (기본값 20)
+#   restricted  : list() = unrestricted (10개 파라미터 전체 추정)
 #   verbose     : 진행 메시지 출력 여부
+#
+# ── 추정 전략 ────────────────────────────────────────────────────────────────
+#   ECM + Unrestricted (10개 파라미터) 단일 방법으로 통일.
+#   · 폴백(ML, Restricted) 없이 동일한 방법론으로 일관된 결과 생성
+#   · 넉넉한 타임아웃(기본 1200초=20분)으로 교착만 방지하고
+#     수렴에 충분한 시간을 부여하여 최적해 탐색
+#   · 타임아웃 또는 수렴 실패 시 해당 윈도우를 스킵
 #
 # ── 적응형 초기화 전략 (Adaptive Initialization) ────────────────────────────
 #   60영업일 롤링 윈도우에서 연속 두 윈도우는 59일(98.3%)이 겹친다.
@@ -24,69 +30,31 @@
 #   → 전략:
 #     · 첫 번째 윈도우 (i = WINDOW_SIZE):
 #         initialsets = "GE",   num_init = NUM_INIT_FIRST (기본 20)
-#         탐색 범위 넓게 → 전역 최적에 가까운 해 확보
-#     · 이후 윈도우 (i > WINDOW_SIZE, 직전 추정 성공한 경우):
+#     · 이후 윈도우 (직전 추정 성공):
 #         initialsets = 이전 파라미터 1행 data.frame (warm-start)
 #         + num_init = NUM_INIT_ROLL (기본 5) 개의 GE 랜덤 초기점 추가
-#         초기점 = 이전 수렴값 + 소수의 탐색 집합 → 수렴 안정성 유지
-#     · 이후 윈도우 (직전 추정 실패한 경우):
-#         warm-start 초기점 없으므로 첫 번째 윈도우와 동일하게 처리
+#     · 이후 윈도우 (직전 추정 실패):
 #         initialsets = "GE",   num_init = NUM_INIT_FIRST
-#
-#   ※ PIN은 num_init 파라미터 자체가 없어 이 전략을 적용할 수 없다.
-#     pin() 시그니처: pin(data, method, initialsets, verbose)
-#     초기점 개수는 initialsets 종류에 따라 내부 고정 (예: "EA" → 5개)
 #
 # ─── 입출력 ───────────────────────────────────────────────────────────────────
 # 입력  : R_output/{COUNTRY}/full_daily_bs.parquet  (01_preprocess.py 출력)
-#           · PIN(00pin/)과 동일 파일 공유 — 먼저 실행된 쪽의 캐시 재사용
-#           · 스키마: Symbol(Utf8), Date(Date), B(Int32), S(Int32)
-#           · 영업일 캘린더 정렬 완료: 거래 없는 날에 B=S=0 행 삽입
 # 출력  : R_output/{COUNTRY}/apin/
 #           apin_{COUNTRY}_{YYYYMMDD_HHMM}.parquet   ← 전체 추정 결과
 #           apin_{COUNTRY}_{YYYYMMDD_HHMM}_sample1000.csv  ← 눈으로 확인용 1000행
 #           checkpoints/sym_{Symbol}.parquet          ← 종목별 체크포인트
 #
-# ─── 처리 흐름 ────────────────────────────────────────────────────────────────
-# [1] full_daily_bs.parquet 로드
-#       · 영업일 캘린더 정렬이 완료된 파일이므로 60행 = 정확히 60 영업일
-# [2] 체크포인트 확인
-#       · checkpoints/sym_*.parquet 스캔 → 완료 종목 파악
-#       · remaining_syms = setdiff(all_symbols, completed_syms)
-#       · 이미 모두 완료됐으면 [3][4] 스킵 → [5] 병합으로 직행
-# [3] 종목별 데이터 분할 + 워커 인자 구성
-#       · split(daily_bs, Symbol) → 종목별 data.frame
-#       · 각 종목 args 리스트 구성 (sym_df, 설정값 등)
-# [4] 병렬 추정 — makeCluster(PSOCK) + parLapply
-#       · PSOCK: Windows·Linux·macOS 모두 호환, 독립 Rscript 프로세스
-#       · 1코어 = 1종목: 한 워커가 해당 종목의 전체 기간 롤링 추정 완주
-#       · 윈도우(i − WINDOW_SIZE + 1 : i) 슬라이딩, i = WINDOW_SIZE … n_days
-#         - valid_days < MIN_VALID_DAYS 인 윈도우 → 스킵
-#         - adjpin() 수렴 실패 → 스킵 (warm-start 초기점 초기화)
-#         - 첫 번째 윈도우 또는 직전 실패 → num_init = NUM_INIT_FIRST
-#         - 직전 성공 → warm-start + num_init = NUM_INIT_ROLL
-#       · 완료 즉시 checkpoints/sym_{Symbol}.parquet 독립 저장 (레이스컨디션 없음)
-#       · CHECKPOINT_N 종목마다 진행률·ETA 로그 출력
-# [5] 체크포인트 병합 → 최종 결과 저장
-#       · 모든 sym_*.parquet → rbind → Symbol·Date 정렬
-#       · parquet(전체) + CSV(샘플 1000행) 저장
-#
-# ─── 캘린더 정렬이 필요한 이유 ────────────────────────────────────────────────
-#   틱에서 거래가 없는 날은 행 자체가 존재하지 않는다.
-#   정렬 없이 60행 윈도우를 잡으면 실제로는 수개월치가 될 수 있어
-#   추정 기준일이 부정확해진다. B=S=0 행 삽입 후 60행 = 정확히 60 영업일.
-#
 # ─── 실행 ─────────────────────────────────────────────────────────────────────
 #   Rscript 01apin/02_r_apin.R
 #
 # ─── 의존 패키지 (최초 1회) ───────────────────────────────────────────────────
-#   install.packages(c("PINstimation", "arrow", "parallel"))
+#   install.packages(c("PINstimation", "arrow", "parallel", "R.utils"))
 # =============================================================================
 
 suppressPackageStartupMessages({
   library(PINstimation)
   library(arrow)
   library(parallel)
+  library(R.utils)
 })
 
 
@@ -96,24 +64,30 @@ suppressPackageStartupMessages({
 
 BASE_DIR <- "C:/vpin_project/vpin_project_parquet/processing_data"
 COUNTRY  <- "KOR"
+
 # ── 롤링 윈도우 파라미터 ──────────────────────────────────────────────────────
 WINDOW_SIZE    <- 60   # 롤링 윈도우 크기 (영업일)
 MIN_VALID_DAYS <- 30   # 윈도우 내 실제 거래일(B+S>0) 최솟값
 
 # ── adjpin() 파라미터 ─────────────────────────────────────────────────────────
-# adjpin() 시그니처: adjpin(data, method, initialsets, num_init, restricted, ..., verbose)
-ADJPIN_METHOD  <- "ECM"   # "ECM" (기본) 또는 "ML"
-ADJPIN_INITSETS <- "GE"   # 초기점 생성 방법: "GE" | "CL" | "RANDOM"
+ADJPIN_METHOD   <- "ECM"   # ECM Unrestricted 단일 방법
+ADJPIN_INITSETS <- "GE"    # 초기점 생성 방법
 
 # 적응형 num_init 설정
-# · NUM_INIT_FIRST : 첫 번째 윈도우 또는 직전 추정 실패 시 사용 (넓은 탐색)
-# · NUM_INIT_ROLL  : 직전 추정 성공 후 warm-start와 함께 사용 (좁은 탐색)
-NUM_INIT_FIRST <- 20   # 첫 번째 윈도우 초기점 수
-NUM_INIT_ROLL  <-  5   # 이후 롤링 윈도우 초기점 수 (warm-start 사용 시)
+NUM_INIT_FIRST <- 20   # 첫 번째 윈도우 또는 직전 실패 시
+NUM_INIT_ROLL  <-  5   # 직전 성공 후 warm-start 사용 시
 
 # ── 병렬 설정 ────────────────────────────────────────────────────────────────
 NUM_WORKERS  <- parallel::detectCores(logical = TRUE)
 CHECKPOINT_N <- 100
+
+# ── 타임아웃 설정 ────────────────────────────────────────────────────────────
+# adjpin() 단일 호출의 시간 제한 (초)
+# 대부분의 윈도우는 수 초 ~ 수십 초에 완료됨.
+# 600초(10분)는 교착 상태만 방지하기 위한 안전장치이며,
+# 정상적인 수렴 과정에는 충분한 시간을 제공함.
+TIMEOUT_SEC <- 600
+
 
 # =============================================================================
 # (이하 수정 불필요)
@@ -130,10 +104,11 @@ cat(sprintf("  나라코드    : %s\n", COUNTRY))
 cat(sprintf("  INPUT_PATH  : %s\n", INPUT_PATH))
 cat(sprintf("  OUTPUT_DIR  : %s\n", OUTPUT_DIR))
 cat(sprintf("  윈도우 크기 : %d영업일  |  최소 유효일: %d일\n", WINDOW_SIZE, MIN_VALID_DAYS))
-cat(sprintf("  Method      : %s  |  InitSets: %s\n", ADJPIN_METHOD, ADJPIN_INITSETS))
-cat(sprintf("  num_init    : 첫 번째 윈도우 = %d  |  롤링 윈도우 = %d (warm-start)\n",
+cat(sprintf("  Method      : %s Unrestricted  |  InitSets: %s\n", ADJPIN_METHOD, ADJPIN_INITSETS))
+cat(sprintf("  num_init    : 첫 윈도우 = %d  |  롤링 = %d (warm-start)\n",
             NUM_INIT_FIRST, NUM_INIT_ROLL))
 cat(sprintf("  CPU 코어    : %d개  |  로그 간격: %d종목\n", NUM_WORKERS, CHECKPOINT_N))
+cat(sprintf("  타임아웃    : %d초 (%.0f분)\n", TIMEOUT_SEC, TIMEOUT_SEC / 60))
 
 
 # =============================================================================
@@ -174,13 +149,14 @@ if (length(remaining_syms) == 0)
 
 
 # =============================================================================
-# [3] 종목 데이터 분할 + 워커 인자 구성
+# [3] 워커 함수 정의
 # =============================================================================
 
 worker_process_symbol <- function(args) {
   suppressPackageStartupMessages({
     library(PINstimation)
     library(arrow)
+    library(R.utils)
   })
 
   sym_df         <- args$sym_df
@@ -192,15 +168,11 @@ worker_process_symbol <- function(args) {
   initsets       <- args$initsets
   num_init_first <- args$num_init_first
   num_init_roll  <- args$num_init_roll
+  timeout_sec    <- args$timeout_sec
 
   n_days <- nrow(sym_df)
 
-  # AdjPIN 파라미터 순서: (α, δ, θ, θ', εb, εs, μb, μs, Δb, Δs)
-  # initialsets에 data.frame을 넘기면 해당 행을 초기점으로 직접 사용 (warm-start)
-  # num_init는 "GE"/"CL"/"RANDOM" 방식일 때 생성할 초기점 개수를 제어
-  # warm-start 시: 이전 파라미터 1행 data.frame + num_init_roll 개의 추가 GE 초기점
-  #   → adjpin()이 initialsets(data.frame)과 num_init를 함께 받으면
-  #     data.frame의 행을 포함해 총 초기점을 사용함
+  # ── warm-start용 data.frame 생성 ──────────────────────────────────────────
   make_warm_start_df <- function(prev_params) {
     data.frame(
       alpha  = prev_params["alpha"],
@@ -217,11 +189,55 @@ worker_process_symbol <- function(args) {
     )
   }
 
-  # 직전 윈도우 추정 파라미터 (warm-start 용)
-  # NULL = 아직 성공한 추정 없음 → 첫 번째 윈도우 전략 사용
-  prev_params <- NULL
+  # ── adjpin() 단일 호출 + 타임아웃 래퍼 ────────────────────────────────────
+  # 성공: list(converged=TRUE, params_raw=..., a=..., APIN=..., ...)
+  # 실패: list(converged=FALSE)
+  safe_adjpin <- function(window_df, cur_initialsets, cur_num_init) {
+    tryCatch({
+      withTimeout({
+        res <- adjpin(
+          data        = window_df,
+          method      = method,
+          initialsets = cur_initialsets,
+          num_init    = cur_num_init,
+          restricted  = list(),
+          verbose     = FALSE
+        )
 
-  results <- list()
+        # adjpin이 내부적으로 실패하면 @adjpin 슬롯이 NaN이 될 수 있음
+        apin_val <- as.numeric(res@adjpin)
+        if (is.na(apin_val) || is.nan(apin_val)) {
+          return(list(converged = FALSE))
+        }
+
+        params <- res@parameters
+        list(
+          converged  = TRUE,
+          a          = as.numeric(params["alpha"]),
+          d          = as.numeric(params["delta"]),
+          t1         = as.numeric(params["theta"]),
+          t2         = as.numeric(params["thetap"]),
+          ub         = as.numeric(params["mu.b"]),
+          us         = as.numeric(params["mu.s"]),
+          eb         = as.numeric(params["eps.b"]),
+          es         = as.numeric(params["eps.s"]),
+          pb         = as.numeric(params["d.b"]),
+          ps         = as.numeric(params["d.s"]),
+          APIN       = apin_val,
+          PSOS       = as.numeric(res@psos),
+          params_raw = params
+        )
+      }, timeout = timeout_sec, onTimeout = "error")
+    }, error = function(e) {
+      list(converged = FALSE)
+    })
+  }
+
+  # ── 상태 변수 ─────────────────────────────────────────────────────────────
+  prev_params   <- NULL           # 직전 윈도우 추정 파라미터 (warm-start 용)
+  results       <- list()
+  count_success <- 0L
+  count_skip    <- 0L
 
   if (n_days >= window_size) {
     for (i in window_size:n_days) {
@@ -233,9 +249,7 @@ worker_process_symbol <- function(args) {
 
       window_df <- data.frame(B = window_B, S = window_S)
 
-      # 적응형 초기화:
-      #   직전 추정 성공(prev_params 보유) → warm-start + num_init_roll
-      #   직전 추정 실패 또는 첫 윈도우   → 표준 GE    + num_init_first
+      # 적응형 초기화: warm-start 또는 fresh GE
       if (!is.null(prev_params)) {
         cur_initialsets <- make_warm_start_df(prev_params)
         cur_num_init    <- num_init_roll
@@ -244,53 +258,70 @@ worker_process_symbol <- function(args) {
         cur_num_init    <- num_init_first
       }
 
-      est <- tryCatch({
-        res    <- adjpin(data = window_df, method = method,
-                         initialsets = cur_initialsets,
-                         num_init    = cur_num_init,
-                         verbose     = FALSE)
-        params <- res@parameters
-        list(a  = as.numeric(params["alpha"]),   d  = as.numeric(params["delta"]),
-             t1 = as.numeric(params["theta"]),   t2 = as.numeric(params["thetap"]),
-             ub = as.numeric(params["mu.b"]),    us = as.numeric(params["mu.s"]),
-             eb = as.numeric(params["eps.b"]),   es = as.numeric(params["eps.s"]),
-             pb = as.numeric(params["d.b"]),     ps = as.numeric(params["d.s"]),
-             APIN = as.numeric(res@adjpin), PSOS = as.numeric(res@psos),
-             params_raw = params,   # warm-start 전달용
-             converged = TRUE)
-      }, error = function(e) list(converged = FALSE))
+      # ── ECM Unrestricted 추정 (타임아웃 내 수렴 시도) ──────────────────
+      est <- safe_adjpin(window_df, cur_initialsets, cur_num_init)
 
       if (!isTRUE(est$converged)) {
-        # 수렴 실패 → warm-start 초기화 (다음 윈도우에서 다시 넓은 탐색)
+        # 수렴 실패 또는 타임아웃 → 스킵, warm-start 초기화
+        count_skip  <- count_skip + 1L
         prev_params <- NULL
         next
       }
 
       # 수렴 성공 → 다음 윈도우를 위해 파라미터 저장
-      prev_params <- est$params_raw
+      count_success <- count_success + 1L
+      prev_params   <- est$params_raw
 
       results[[length(results) + 1]] <- data.frame(
-        Symbol = symbol, Date = as.Date(sym_df$Date[i]), valid_days = valid_days,
-        a = est$a, d = est$d, t1 = est$t1, t2 = est$t2,
-        ub = est$ub, us = est$us, eb = est$eb, es = est$es,
-        pb = est$pb, ps = est$ps, APIN = est$APIN, PSOS = est$PSOS,
+        Symbol     = symbol,
+        Date       = as.Date(sym_df$Date[i]),
+        valid_days = valid_days,
+        a          = est$a,
+        d          = est$d,
+        t1         = est$t1,
+        t2         = est$t2,
+        ub         = est$ub,
+        us         = est$us,
+        eb         = est$eb,
+        es         = est$es,
+        pb         = est$pb,
+        ps         = est$ps,
+        APIN       = est$APIN,
+        PSOS       = est$PSOS,
         stringsAsFactors = FALSE
       )
     }
   }
 
-  result_df <- if (length(results) > 0) do.call(rbind, results) else
-    data.frame(Symbol = character(0), Date = as.Date(character(0)),
-               valid_days = integer(0),
-               a = numeric(0), d = numeric(0), t1 = numeric(0), t2 = numeric(0),
-               ub = numeric(0), us = numeric(0), eb = numeric(0), es = numeric(0),
-               pb = numeric(0), ps = numeric(0), APIN = numeric(0), PSOS = numeric(0))
+  # ── 결과 조립 + 체크포인트 저장 ───────────────────────────────────────────
+  if (length(results) > 0) {
+    result_df <- do.call(rbind, results)
+  } else {
+    result_df <- data.frame(
+      Symbol = character(0), Date = as.Date(character(0)),
+      valid_days = integer(0),
+      a = numeric(0), d = numeric(0), t1 = numeric(0), t2 = numeric(0),
+      ub = numeric(0), us = numeric(0), eb = numeric(0), es = numeric(0),
+      pb = numeric(0), ps = numeric(0), APIN = numeric(0), PSOS = numeric(0),
+      stringsAsFactors = FALSE
+    )
+  }
 
   out_path <- file.path(checkpoint_dir, paste0("sym_", symbol, ".parquet"))
   arrow::write_parquet(result_df, out_path, compression = "zstd")
-  return(list(symbol = symbol, n_rows = nrow(result_df)))
+
+  return(list(
+    symbol  = symbol,
+    n_rows  = nrow(result_df),
+    success = count_success,
+    skipped = count_skip
+  ))
 }
 
+
+# =============================================================================
+# [3-b] 종목 데이터 분할 + 병렬 처리
+# =============================================================================
 
 if (length(remaining_syms) > 0) {
 
@@ -301,22 +332,34 @@ if (length(remaining_syms) > 0) {
   symbol_args <- lapply(remaining_syms, function(sym) {
     rows <- split_bs[[sym]]
     rows <- rows[order(rows$Date), ]
-    list(sym_df = rows, symbol = sym, checkpoint_dir = CHECKPOINT_DIR,
-         window_size = WINDOW_SIZE, min_valid_days = MIN_VALID_DAYS,
-         method = ADJPIN_METHOD, initsets = ADJPIN_INITSETS,
-         num_init_first = NUM_INIT_FIRST, num_init_roll = NUM_INIT_ROLL)
+    list(
+      sym_df         = rows,
+      symbol         = sym,
+      checkpoint_dir = CHECKPOINT_DIR,
+      window_size    = WINDOW_SIZE,
+      min_valid_days = MIN_VALID_DAYS,
+      method         = ADJPIN_METHOD,
+      initsets       = ADJPIN_INITSETS,
+      num_init_first = NUM_INIT_FIRST,
+      num_init_roll  = NUM_INIT_ROLL,
+      timeout_sec    = TIMEOUT_SEC
+    )
   })
   cat("  분할 완료\n")
 
-  # =============================================================================
+  # ==========================================================================
   # [4] 병렬 처리
-  # =============================================================================
+  # ==========================================================================
 
   n_remaining <- length(remaining_syms)
   n_workers   <- min(NUM_WORKERS, n_remaining)
 
-  cat(sprintf("\n[4] adjpin() 병렬 추정 — 워커 %d개, 윈도우 %d일\n%s\n",
-              n_workers, WINDOW_SIZE, strrep("-", 65)))
+  cat(sprintf(paste0(
+    "\n[4] adjpin() 병렬 추정 — ECM Unrestricted\n",
+    "    워커 %d개 | 윈도우 %d일 | 타임아웃 %d초(%.0f분)\n",
+    "    수렴 실패 또는 타임아웃 → 스킵\n%s\n"),
+    n_workers, WINDOW_SIZE, TIMEOUT_SEC, TIMEOUT_SEC / 60,
+    strrep("-", 65)))
 
   start_time <- Sys.time()
   cl <- makeCluster(n_workers, type = "PSOCK")
@@ -324,13 +367,34 @@ if (length(remaining_syms) > 0) {
 
   batch_starts <- seq(1, n_remaining, by = CHECKPOINT_N)
 
+  # 전체 통계 누적
+  total_success <- 0L; total_skip <- 0L
+
   for (bi in seq_along(batch_starts)) {
     b_start <- batch_starts[bi]
     b_end   <- min(b_start + CHECKPOINT_N - 1, n_remaining)
-    tryCatch(
+
+    batch_result <- tryCatch(
       parLapply(cl, symbol_args[b_start:b_end], worker_process_symbol),
-      error = function(e) cat(sprintf("  [Warning] 배치 %d 오류: %s\n", bi, e$message))
+      error = function(e) {
+        cat(sprintf("  [Warning] 배치 %d 오류: %s\n", bi, e$message))
+        NULL
+      }
     )
+
+    # ── 배치별 통계 집계 ─────────────────────────────────────────────────
+    if (!is.null(batch_result)) {
+      batch_ok   <- sum(vapply(batch_result, function(x) x$success, integer(1)))
+      batch_skip <- sum(vapply(batch_result, function(x) x$skipped, integer(1)))
+
+      total_success <- total_success + batch_ok
+      total_skip    <- total_skip    + batch_skip
+
+      if (batch_skip > 0) {
+        cat(sprintf("  [Skip] 이 배치: 성공=%d  스킵=%d\n", batch_ok, batch_skip))
+      }
+    }
+
     n_done  <- length(completed_syms) + b_end
     elapsed <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
     eta_min <- if (b_end > 0) elapsed / b_end * (n_remaining - b_end) else NA
@@ -339,8 +403,17 @@ if (length(remaining_syms) > 0) {
                 if (!is.na(eta_min)) sprintf(" | 예상 잔여 %.0f분", eta_min) else ""))
   }
 
+  # ── 전체 통계 요약 ──────────────────────────────────────────────────────
+  total_windows <- total_success + total_skip
   cat(sprintf("\n  총 소요 시간: %.1f분\n",
               as.numeric(difftime(Sys.time(), start_time, units = "mins"))))
+  cat(sprintf("\n  [추정 통계 — 전체 %s 윈도우]\n", format(total_windows, big.mark = ",")))
+  cat(sprintf("    성공 (ECM)  : %s (%.1f%%)\n",
+              format(total_success, big.mark = ","),
+              if (total_windows > 0) total_success / total_windows * 100 else 0))
+  cat(sprintf("    스킵        : %s (%.1f%%)\n",
+              format(total_skip, big.mark = ","),
+              if (total_windows > 0) total_skip / total_windows * 100 else 0))
 }
 
 
@@ -353,7 +426,9 @@ cat(sprintf("\n[5] 체크포인트 병합 중...\n"))
 all_ckpt_files <- list.files(CHECKPOINT_DIR, pattern = "^sym_.*\\.parquet$", full.names = TRUE)
 cat(sprintf("  체크포인트 파일 수: %d개\n", length(all_ckpt_files)))
 
-all_dfs   <- lapply(all_ckpt_files, function(f) tryCatch(arrow::read_parquet(f), error = function(e) NULL))
+all_dfs   <- lapply(all_ckpt_files, function(f) {
+  tryCatch(arrow::read_parquet(f), error = function(e) NULL)
+})
 non_empty <- Filter(function(df) !is.null(df) && nrow(df) > 0, all_dfs)
 
 if (length(non_empty) == 0) {
@@ -381,6 +456,7 @@ if (length(non_empty) == 0) {
               min(final_df$APIN, na.rm = TRUE),
               max(final_df$APIN, na.rm = TRUE),
               mean(final_df$APIN, na.rm = TRUE)))
+
   cat(sprintf("\n  parquet (전체)     : %s\n", parquet_path))
   cat(sprintf("  CSV (샘플 1000행)  : %s\n", csv_path))
   cat(sprintf("  체크포인트         : %s\n", CHECKPOINT_DIR))
